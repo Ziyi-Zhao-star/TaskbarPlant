@@ -1,4 +1,4 @@
-# TaskbarPlant 桌面电子盆栽
+# TaskbarPlant 桌面电子盆栽（记得看看最后！）
 
 ![version](https://img.shields.io/badge/version-v2.0.0-c98a4b)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-4e9a4e)
