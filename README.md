@@ -19,3 +19,7 @@ Windows 桌面上的一盆「电子盆栽」：单个 C++ 文件、无第三方�
 
 双击 `build.bat` 即可（自动查找 MinGW g++，找不到再找 MSVC cl），
 也可以手动执行：
+
+## 你在找Linux版吗？
+
+我的朋友已经移植好了，在https://github.com/Epiphany106-blip/taskbarplant-linux
