@@ -37,8 +37,10 @@
 #include <dwmapi.h>      // DWMWA_CLOAKED：识别其它虚拟桌面上的窗口
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include <string>
 #include <vector>
 
 #pragma comment(lib, "gdiplus.lib")
@@ -72,6 +74,13 @@ static const float    GRAVITY = 2400.0f;            // 重力加速度 px/s^2
 static const float    RESTITUTION = 0.42f;          // 弹跳系数
 static const float    PI_F = 3.14159265f;
 
+// 花盆大小 / 水分
+static const float    POT_SCALE_MIN = 0.65f;        // 花盆最小缩放
+static const float    POT_SCALE_MAX = 1.45f;        // 花盆最大缩放
+static const float    POT_SCALE_STEP = 0.1f;        // 每次调大/调小的步进
+static const float    DRY_THRESHOLD = 0.40f;        // 水分低于它开始发蔫
+static const float    WATER_DURATION = 2.2f;        // 浇水动画时长（秒）
+
 static const wchar_t* kWndClass = L"TaskbarPlant_Window";
 static const wchar_t* kMenuClass = L"TaskbarPlant_Menu";
 
@@ -99,8 +108,13 @@ enum PlantType {
 
 // 右键菜单：先是植物列表，再是命令
 enum MenuCmd {
-    MENU_CMD_SPAWN = PLANT_COUNT,   // 放置新花盆
+    MENU_CMD_WATER = PLANT_COUNT,   // 浇水
+    MENU_CMD_EDIT,                  // 编辑模式
+    MENU_CMD_SCALE_UP,              // 花盆调大
+    MENU_CMD_SCALE_DOWN,            // 花盆调小
+    MENU_CMD_SPAWN,                 // 放置新花盆
     MENU_CMD_REMOVE,                // 移除这个花盆
+    MENU_CMD_EXPORT,                // 导出植物图片
     MENU_CMD_QUIT,                  // 退出程序
     MENU_ITEM_COUNT
 };
@@ -109,7 +123,8 @@ static const wchar_t* kMenuItemText[MENU_ITEM_COUNT] = {
     L"仙人掌", L"向日葵", L"食人花", L"郁金香", L"蘑菇",
     L"小松树", L"多肉", L"竹子", L"玫瑰",
     L"薰衣草", L"三叶草", L"辣椒", L"蒲公英",
-    L"放置新花盆", L"移除这个花盆", L"退出程序"
+    L"浇水", L"编辑模式", L"花盆调大", L"花盆调小",
+    L"放置新花盆", L"移除这个花盆", L"导出植物图片", L"退出程序"
 };
 static const int kMenuCount = MENU_ITEM_COUNT;
 static const int kMenuW = 178;
@@ -140,6 +155,10 @@ struct Pot {
     float     surfaceY;   // 当前“脚下”的承托面
     HWND      supportHwnd;
     float     supportY;
+    float     scale;      // 花盆整体大小（POT_SCALE_MIN ~ POT_SCALE_MAX）
+    float     moisture;   // 泥土水分 1=湿透 0=干透
+    float     waterAnim;  // 浇水动画剩余时间（秒），0 表示没在浇水
+    float     shedTimer;  // 枯叶掉落节流
 };
 
 static HWND  g_hwnd = nullptr;
@@ -164,6 +183,31 @@ static int               g_activePot = -1;  // 右键菜单 / 拖拽针对的花
 static float             g_spawnX = 0.0f, g_spawnY = 0.0f;  // “放置新花盆”的位置
 static float             g_time = 0.0f;
 static std::vector<Crumb> g_crumbs;
+
+// 下次启动要恢复的花盆状态（配置文件里读出来的）
+struct PotSeed { int plant; float x, y, scale, moisture; };
+static std::vector<PotSeed> g_seeds;
+static float g_saveTimer = 0.0f;         // 自动保存节流
+
+// 干枯时从植物上掉下来的枯叶碎片（带物理）
+struct WiltParticle { float x, y, vx, vy, life; };
+static std::vector<WiltParticle> g_wilt;
+
+// 编辑模式：此时改动只在内存里，点“保存”才写入 ini
+static bool  g_editMode = false;
+static float g_drySeconds = 120.0f;      // 干枯时间（秒），可在编辑模式里改
+static float g_hudMsgTimer = 0.0f;       // “已保存”提示
+static int   g_hudHot = -1;              // 悬停的按钮
+
+static int   g_hudX = 0, g_hudY = 0, g_hudW = 0, g_hudH = 0;
+static const int HUD_PAD = 12;
+static const int HUD_BTN_W = 150;
+static const int HUD_BTN_H = 40;
+static const int HUD_GAP = 8;
+
+enum HudBtn { HUD_ADD = 0, HUD_DRY, HUD_SAVE, HUD_DONE, HUD_BTN_COUNT };
+
+static float g_mouseX = 0.0f, g_mouseY = 0.0f;
 
 // 脏矩形重绘（全屏缓冲逐帧全清代价太大，只清理上一帧/这一帧的包围盒）
 struct RectI { int l, t, r, b; };
@@ -906,9 +950,9 @@ static void DrawDandelion(Graphics& g, float soilY, float sway, float t)
     FillRectF(g, &stem,     -PIX,  -h, PIX * 2.0f, h);
     FillRectF(g, &stemDark,  PIX,  -h, PIX, h);
 
-    // 贴地叶片
-    DrawPixelLeaf(g, -2.0f,  0.0f, -1, 26.0f, 30.0f, 6.0f, &leaf, nullptr);
-    DrawPixelLeaf(g,  2.0f, -6.0f, +1, 22.0f, 26.0f, 6.0f, &leaf, nullptr);
+    // 贴地叶片（抬高一点，免得被花盆沿挡住）
+    DrawPixelLeaf(g, -2.0f, -10.0f, -1, 34.0f, 30.0f, 6.0f, &leaf, nullptr);
+    DrawPixelLeaf(g,  2.0f, -16.0f, +1, 28.0f, 26.0f, 6.0f, &leaf, nullptr);
 
     // 绒球：两层像素圆 + 外圈八颗绒毛
     const float cx = 0.0f, cy = -h - 12.0f;
@@ -1011,10 +1055,10 @@ static bool IsShellWindow(HWND h)
 }
 
 // 旋转后花盆最低点相对花盆中心的偏移（用于地面碰撞）
-static float PotMaxY(float angle)
+static float PotMaxY(float angle, float scale)
 {
-    const float hw = POT_W * 0.5f;
-    const float hh = POT_H * 0.5f;
+    const float hw = POT_W * 0.5f * scale;
+    const float hh = POT_H * 0.5f * scale;
     const float c = cosf(angle);
     const float s = sinf(angle);
 
@@ -1026,6 +1070,27 @@ static float PotMaxY(float angle)
         }
     }
     return maxY;
+}
+
+// 浇水动画：几串水滴从植物上方落到泥土里（画在花盆局部坐标，随花盆一起旋转/缩放）
+static void DrawWaterAnim(Graphics& g, const Pot& p)
+{
+    if (p.waterAnim <= 0.0f) return;
+
+    float prog = 1.0f - p.waterAnim / WATER_DURATION;    // 0 -> 1
+    SolidBrush water(C(92, 176, 232));
+    SolidBrush waterLight(C(188, 228, 252));
+
+    const float topY = -PlantHeight(p.plant) * 0.85f - 20.0f;
+    const float botY = -POT_H * 0.5f + 2.0f;             // 土面
+    for (int i = 0; i < 7; ++i) {
+        // 每条水线错开相位，循环下落
+        float phase = fmodf(prog * 2.4f + (float)i * 0.143f, 1.0f);
+        float x = SnapPx(-24.0f + (float)i * 8.0f);
+        float y = SnapPx(topY + (botY - topY) * phase);
+        FillRectF(g, &water, x, y, PIX, PIX * 2.0f);
+        FillRectF(g, &waterLight, x, y, PIX, PIX);
+    }
 }
 
 // 查找花盆脚下可站立的平台：默认是任务栏上沿，其次是最上层窗口的标题栏顶边
@@ -1148,8 +1213,40 @@ static void SpawnDust(float x, float y, int count)
 static void UpdatePot(Pot& p, float dt)
 {
     Body& b = p.body;
-    const float hw = POT_W * 0.5f;
-    const float hh = POT_H * 0.5f;
+    const float hw = POT_W * 0.5f * p.scale;
+    const float hh = POT_H * 0.5f * p.scale;
+
+    // 水分：平时慢慢蒸发，浇水动画期间吸饱；编辑模式暂停蒸发
+    if (p.waterAnim > 0.0f) {
+        p.waterAnim -= dt;
+        if (p.waterAnim < 0.0f) p.waterAnim = 0.0f;
+        p.moisture = Clampf(p.moisture + dt / 1.2f, 0.0f, 1.0f);
+        p.swayVel += sinf(g_time * 20.0f) * 0.04f;   // 被水浇得直晃
+    } else if (!g_editMode) {
+        p.moisture = Clampf(p.moisture - dt / g_drySeconds, 0.0f, 1.0f);
+    }
+
+    // 缺水：从植株上不断掉落枯叶碎片（有物理，落到地面才消失）
+    if (!g_editMode && p.moisture < DRY_THRESHOLD) {
+        p.shedTimer -= dt;
+        if (p.shedTimer <= 0.0f && g_wilt.size() < 240) {
+            float dry = (DRY_THRESHOLD - p.moisture) / DRY_THRESHOLD;
+            p.shedTimer = 0.55f - 0.40f * dry;        // 越干掉得越快
+            float lx = (float)((rand() % 41) - 20);
+            float ly = -10.0f - (float)(rand() % (int)(PlantHeight(p.plant) * 0.75f + 1.0f));
+            float c = cosf(b.angle), s = sinf(b.angle);
+            float cx = b.x, cy = b.y - hh;
+            WiltParticle w;
+            w.x = cx + (lx * c - ly * s) * p.scale;
+            w.y = cy + (lx * s + ly * c) * p.scale;
+            w.vx = (float)((rand() % 70) - 35);
+            w.vy = 10.0f + (float)(rand() % 40);
+            w.life = 3.0f;
+            g_wilt.push_back(w);
+        }
+    } else {
+        p.shedTimer = 0.0f;
+    }
 
     if (b.dragged) {
         // 拖拽时位置由鼠标直接给，这里只让花盆随甩动方向翻转
@@ -1177,7 +1274,7 @@ static void UpdatePot(Pot& p, float dt)
     }
 
     // ---------- 承托面：任务栏上沿，或鼠标下方窗口的标题栏 ----------
-    float maxY = PotMaxY(b.angle);
+    float maxY = PotMaxY(b.angle, p.scale);
     float lowest = b.y - hh + maxY;        // 花盆最低点（客户区坐标）
     float surface = g_floorY;
     if (!b.dragged) surface = FindSupportY(p, b.x, lowest);
@@ -1240,6 +1337,28 @@ static void UpdatePhysics(float dt)
     for (size_t i = 0; i < g_pots.size(); ++i)
         UpdatePot(g_pots[i], dt);
 
+    // 枯叶碎片：轻重力 + 横向飘，落到地面就慢慢消失
+    for (size_t i = 0; i < g_wilt.size();) {
+        WiltParticle& w = g_wilt[i];
+        w.vy += 420.0f * dt;
+        w.vx += sinf(g_time * 2.4f + w.y * 0.03f) * 24.0f * dt;
+        w.x += w.vx * dt;
+        w.y += w.vy * dt;
+        w.life -= dt;
+        if (w.y > g_floorY - 3.0f) {
+            w.y = g_floorY - 3.0f;
+            w.vy = 0.0f;
+            w.vx *= 0.85f;
+            w.life -= dt * 3.0f;
+        }
+        if (w.life <= 0.0f) {
+            g_wilt[i] = g_wilt.back();
+            g_wilt.pop_back();
+        } else {
+            ++i;
+        }
+    }
+
     // 泥土碎屑
     for (size_t i = 0; i < g_crumbs.size();) {
         Crumb& c = g_crumbs[i];
@@ -1267,8 +1386,6 @@ static void UpdatePhysics(float dt)
 
 static void DrawScene(Graphics& g)
 {
-    const float hh = POT_H * 0.5f;
-
     // 泥土碎屑
     if (!g_crumbs.empty()) {
         SolidBrush crumb(C(96, 66, 42));
@@ -1279,25 +1396,39 @@ static void DrawScene(Graphics& g)
     for (size_t i = 0; i < g_pots.size(); ++i) {
         const Pot& p = g_pots[i];
         const Body& b = p.body;
+        const float hh = POT_H * 0.5f * p.scale;
 
         // 花盆最低点，用来算投影高度
-        float lowest = b.y - hh + PotMaxY(b.angle);
+        float lowest = b.y - hh + PotMaxY(b.angle, p.scale);
 
         // 承托面上的投影：离地越高越小越淡
         float lift = Clampf((p.surfaceY - lowest) / 160.0f, 0.0f, 1.0f);
-        float sw = 92.0f - lift * 44.0f;
+        float sw = (92.0f - lift * 44.0f) * p.scale;
         int   sa = (int)(100.0f - lift * 70.0f);
         SolidBrush shadow(C(0, 0, 0, sa));
         // 投影整块留在承托面之上，不能漏到任务栏上
         FillPixelEllipse(g, &shadow, b.x, p.surfaceY - 6.0f, sw * 0.5f, 4.0f);
 
-        // 花盆 + 植物共用同一个变换，保证一起旋转
+        // 花盆 + 植物共用同一个变换，保证一起旋转、一起缩放
         GraphicsState st = g.Save();
         g.TranslateTransform(b.x, b.y - hh);
         g.RotateTransform(b.angle * 57.2957795f);
-        DrawPlantLocal(g, -hh + 3.0f, p.plant, p.sway, p.poking);
+        g.ScaleTransform(p.scale, p.scale);
+        DrawPlantLocal(g, -POT_H * 0.5f + 3.0f, p.plant, p.sway, p.poking);
         DrawPotLocal(g);
+        DrawWaterAnim(g, p);
         g.Restore(st);
+    }
+
+    // 枯叶碎片
+    if (!g_wilt.empty()) {
+        SolidBrush leafA(C(176, 146, 60));
+        SolidBrush leafB(C(132, 100, 42));
+        for (size_t i = 0; i < g_wilt.size(); ++i) {
+            const WiltParticle& w = g_wilt[i];
+            FillRectF(g, (i & 1) ? (Brush*)&leafA : (Brush*)&leafB,
+                      w.x, w.y, PIX, PIX);
+        }
     }
 }
 
@@ -1336,11 +1467,11 @@ static bool CreateBackBuffer(int w, int h)
 // 一帧里需要改动的矩形：所有花盆（当前帧 + 上一帧）的包围盒并集
 static void SpriteBounds(RectI& rc)
 {
-    const float hh = POT_H * 0.5f;
     float l = 1e9f, t = 1e9f, r = -1e9f, b = -1e9f;
 
     for (size_t i = 0; i < g_pots.size(); ++i) {
         const Pot& p = g_pots[i];
+        const float hh = POT_H * 0.5f * p.scale;
         const float cx = p.body.x;
         const float cy = p.body.y - hh;          // 旋转中心（花盆几何中心）
 
@@ -1348,8 +1479,8 @@ static void SpriteBounds(RectI& rc)
         // 余量必须给足：玫瑰的花苞绕茎尖旋转后，顶点比 PlantHeight 还高一截，
         // 蒲公英的绒球也顶得很高。超出包围盒的像素不会被 ClearRect 擦掉，
         // 留在缓冲里就成了“拖影”。
-        const float halfW = 112.0f;
-        const float topY  = -(PlantHeight(p.plant) + 80.0f);
+        const float halfW = 112.0f * p.scale;
+        const float topY  = -(PlantHeight(p.plant) + 80.0f) * p.scale;
         const float botY  = hh + 10.0f;
 
         // 按当前角度把四个角转到屏幕坐标再取轴对齐包围盒。
@@ -1373,8 +1504,17 @@ static void SpriteBounds(RectI& rc)
         // 投影
         if (p.surfaceY + 12.0f > b) b = p.surfaceY + 12.0f;
         if (p.surfaceY - 12.0f < t) t = p.surfaceY - 12.0f;
-        if (cx - 54.0f < l) l = cx - 54.0f;
-        if (cx + 54.0f > r) r = cx + 54.0f;
+        if (cx - 54.0f * p.scale < l) l = cx - 54.0f * p.scale;
+        if (cx + 54.0f * p.scale > r) r = cx + 54.0f * p.scale;
+    }
+
+    // 枯叶碎片
+    for (size_t i = 0; i < g_wilt.size(); ++i) {
+        const WiltParticle& w = g_wilt[i];
+        if (w.x - 8.0f < l) l = w.x - 8.0f;
+        if (w.x + 8.0f > r) r = w.x + 8.0f;
+        if (w.y - 8.0f < t) t = w.y - 8.0f;
+        if (w.y + 8.0f > b) b = w.y + 8.0f;
     }
 
     // 碎屑
@@ -1428,72 +1568,85 @@ static void PremultiplyRect(const RectI& rc)
     }
 }
 
-// 纯像素风后处理：把绘制结果压进 4x4 像素格。
-// GDI+ 画的方块在旋转/位移后会落在非整数像素上，边缘出现 1px 宽的碎边；
-// 这里按格重采样，让所有轮廓都变成整齐的方块：
-//   · 格内实心像素过半      → 整格填成实心色块
-//   · 只有零星实心像素      → 保留最靠近格心的那个像素颜色，轮廓断口被补齐
-//   · 没有实心像素但有半透明（投影）→ 整格压成同透明度的色块
-//   · 其余                  → 整格清空
-static void PixelateRect(const RectI& rc)
+// =============================================================================
+//  编辑模式工具条（画在主窗口顶部，随场景一起提交）
+// =============================================================================
+static void HudLayout()
 {
-    int l = rc.l < 0 ? 0 : rc.l;
-    int t = rc.t < 0 ? 0 : rc.t;
-    int r = rc.r > g_winW ? g_winW : rc.r;
-    int b = rc.b > g_winH ? g_winH : rc.b;
-    const int cell = (int)PIX;
+    g_hudW = HUD_PAD * 2 + HUD_BTN_W * HUD_BTN_COUNT + HUD_GAP * (HUD_BTN_COUNT - 1);
+    g_hudH = HUD_BTN_H + HUD_PAD * 2;
+    g_hudX = (g_winW - g_hudW) / 2;
+    g_hudY = 20;
+}
 
-    for (int y = t; y < b; y += cell) {
-        int y1 = y + cell; if (y1 > b) y1 = b;
-        for (int x = l; x < r; x += cell) {
-            int x1 = x + cell; if (x1 > r) x1 = r;
+static void HudButtonRect(int i, float& bx, float& by)
+{
+    bx = (float)(g_hudX + HUD_PAD + i * (HUD_BTN_W + HUD_GAP));
+    by = (float)(g_hudY + HUD_PAD);
+}
 
-            const int total = (y1 - y) * (x1 - x);
-            int solid = 0, semi = 0;
-            unsigned maxA = 0;
-            unsigned char maxR = 0, maxG = 0, maxB = 0;
-            int bestDist = 1 << 30;
-            unsigned char cenR = 0, cenG = 0, cenB = 0;
-            const int ccx = (x + x1) >> 1;
-            const int ccy = (y + y1) >> 1;
+static int HudButtonAt(float mx, float my)
+{
+    if (!g_editMode) return -1;
+    HudLayout();
+    for (int i = 0; i < HUD_BTN_COUNT; ++i) {
+        float bx, by;
+        HudButtonRect(i, bx, by);
+        if (mx >= bx && mx <= bx + HUD_BTN_W && my >= by && my <= by + HUD_BTN_H)
+            return i;
+    }
+    return -1;
+}
 
-            for (int yy = y; yy < y1; ++yy) {
-                const unsigned char* p = (const unsigned char*)g_bits
-                                       + ((size_t)yy * (size_t)g_winW + (size_t)x) * 4;
-                for (int xx = x; xx < x1; ++xx, p += 4) {
-                    unsigned a = p[3];
-                    if (a >= 128) {
-                        ++solid;
-                        int dxp = xx - ccx, dyp = yy - ccy;
-                        int d = dxp * dxp + dyp * dyp;
-                        if (d < bestDist) {
-                            bestDist = d;
-                            cenB = p[0]; cenG = p[1]; cenR = p[2];
-                        }
-                    } else if (a > 0) {
-                        ++semi;
-                    }
-                    if (a > maxA) { maxA = a; maxB = p[0]; maxG = p[1]; maxR = p[2]; }
-                }
-            }
+static void DrawEditHud(Graphics& g)
+{
+    HudLayout();
 
-            unsigned char outA, outR, outG, outB;
-            if (solid > 0) {
-                outA = 255; outR = cenR; outG = cenG; outB = cenB;
-            } else if (semi * 4 >= total) {
-                outA = (unsigned char)maxA; outR = maxR; outG = maxG; outB = maxB;
-            } else {
-                outA = 0; outR = outG = outB = 0;
-            }
+    // 必须用 GDI+ 自己的文字光栅化：走 GDI 的话写进 DIB 的 alpha 是 0，预乘后文字会消失
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
 
-            for (int yy = y; yy < y1; ++yy) {
-                unsigned char* p = (unsigned char*)g_bits
-                                 + ((size_t)yy * (size_t)g_winW + (size_t)x) * 4;
-                for (int xx = x; xx < x1; ++xx, p += 4) {
-                    p[0] = outB; p[1] = outG; p[2] = outR; p[3] = outA;
-                }
-            }
-        }
+    // 面板底色 + 像素边框
+    SolidBrush panel(C(26, 20, 16, 235));
+    FillRectF(g, &panel, (float)g_hudX, (float)g_hudY, (float)g_hudW, (float)g_hudH);
+    SolidBrush edge(C(196, 148, 92, 240));
+    FillRectF(g, &edge, (float)g_hudX, (float)g_hudY, (float)g_hudW, 2.0f);
+    FillRectF(g, &edge, (float)g_hudX, (float)(g_hudY + g_hudH - 2), (float)g_hudW, 2.0f);
+    FillRectF(g, &edge, (float)g_hudX, (float)g_hudY, 2.0f, (float)g_hudH);
+    FillRectF(g, &edge, (float)(g_hudX + g_hudW - 2), (float)g_hudY, 2.0f, (float)g_hudH);
+
+    static Gdiplus::Font* font = nullptr;
+    static Gdiplus::StringFormat* fmt = nullptr;
+    if (!font) font = new Gdiplus::Font(L"Microsoft YaHei", 15.0f,
+                                       Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+    if (!fmt) {
+        fmt = new Gdiplus::StringFormat();
+        fmt->SetAlignment(Gdiplus::StringAlignmentCenter);
+        fmt->SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    }
+
+    wchar_t dry[64];
+    wsprintfW(dry, L"干枯 %d 秒", (int)g_drySeconds);
+    const wchar_t* labels[HUD_BTN_COUNT] = {
+        L"+ 新花盆", dry,
+        (g_hudMsgTimer > 0.0f ? L"已保存" : L"保存"), L"完成"
+    };
+
+    for (int i = 0; i < HUD_BTN_COUNT; ++i) {
+        float bx, by;
+        HudButtonRect(i, bx, by);
+        bool hot = (i == g_hudHot);
+
+        SolidBrush b(hot ? C(122, 74, 42) : C(74, 52, 36));
+        FillRectF(g, &b, bx, by, (float)HUD_BTN_W, (float)HUD_BTN_H);
+        SolidBrush line(hot ? C(236, 190, 128) : C(150, 112, 72));
+        FillRectF(g, &line, bx, by, (float)HUD_BTN_W, 2.0f);
+        FillRectF(g, &line, bx, by + HUD_BTN_H - 2, (float)HUD_BTN_W, 2.0f);
+        FillRectF(g, &line, bx, by, 2.0f, (float)HUD_BTN_H);
+        FillRectF(g, &line, bx + HUD_BTN_W - 2, by, 2.0f, (float)HUD_BTN_H);
+
+        SolidBrush txt(C(246, 240, 230));
+        RectF layout(bx, by + 8.0f, (float)HUD_BTN_W, 24.0f);
+        g.DrawString(labels[i], -1, font, layout, fmt, &txt);
     }
 }
 
@@ -1519,17 +1672,17 @@ static void Present()
         }
     }
 
+    // 编辑模式工具条：并进脏矩形，保证悬停/提示文字变化能被提交
+    if (g_editMode) {
+        HudLayout();
+        if (g_hudX - 2 < rc.l) rc.l = g_hudX - 2;
+        if (g_hudY - 2 < rc.t) rc.t = g_hudY - 2;
+        if (g_hudX + g_hudW + 2 > rc.r) rc.r = g_hudX + g_hudW + 2;
+        if (g_hudY + g_hudH + 2 > rc.b) rc.b = g_hudY + g_hudH + 2;
+    }
+
     if (rc.l < 0) rc.l = 0;
     if (rc.t < 0) rc.t = 0;
-    if (rc.r > g_winW) rc.r = g_winW;
-    if (rc.b > g_winH) rc.b = g_winH;
-
-    // 脏矩形向外对齐到像素格，像素化后格子边界才不会出现半格
-    const int pix = (int)PIX;
-    rc.l = (rc.l / pix) * pix;
-    rc.t = (rc.t / pix) * pix;
-    rc.r = ((rc.r + pix - 1) / pix) * pix;
-    rc.b = ((rc.b + pix - 1) / pix) * pix;
     if (rc.r > g_winW) rc.r = g_winW;
     if (rc.b > g_winH) rc.b = g_winH;
 
@@ -1543,8 +1696,8 @@ static void Present()
         // 硬裁剪：任何像素都不许画到任务栏上沿以下（任务栏区域归任务栏）
         if (g_floorY > 0.0f) gfx.SetClip(RectF(0.0f, 0.0f, (float)g_winW, g_floorY));
         DrawScene(gfx);
+        if (g_editMode) DrawEditHud(gfx);
     }
-    PixelateRect(rc);          // 压成 4px 方块，纯像素风
     PremultiplyRect(rc);
 
     POINT src = { 0, 0 };
@@ -1579,6 +1732,144 @@ static void Present()
     g_prevDirty = cur;
     g_hasPrevDirty = true;
     g_fullRedraw = false;
+}
+
+// =============================================================================
+//  三·五、配置持久化 / 导出植物图片
+// =============================================================================
+
+static std::wstring ExeDir()
+{
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return std::wstring();
+    wchar_t* slash = wcsrchr(exe, L'\\');
+    if (!slash) return std::wstring();
+    *(slash + 1) = 0;
+    return std::wstring(exe);
+}
+
+static std::wstring ConfigPath()
+{
+    return ExeDir() + L"TaskbarPlant.ini";
+}
+
+// 读上次保存的花盆清单：植物 / 位置 / 大小 / 水分
+static void LoadConfig()
+{
+    g_seeds.clear();
+    HANDLE f = CreateFileW(ConfigPath().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+
+    static char buf[16384];
+    DWORD got = 0;
+    ReadFile(f, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(f);
+    buf[got] = 0;
+
+    const char* p = buf;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+        if (!*p) break;
+        if (*p == '#') { while (*p && *p != '\n') ++p; continue; }
+
+        // dry <秒>：满水到干透的时间
+        if (strncmp(p, "dry", 3) == 0) {
+            float d = g_drySeconds;
+            if (sscanf(p + 3, "%f", &d) == 1)
+                g_drySeconds = Clampf(d, 10.0f, 3600.0f);
+            while (*p && *p != '\n') ++p;
+            continue;
+        }
+
+        PotSeed s = { 0, 0.0f, 0.0f, 1.0f, 1.0f };
+        int n = sscanf(p, "%d %f %f %f %f", &s.plant, &s.x, &s.y, &s.scale, &s.moisture);
+        if (n >= 3) {
+            if (s.plant < 0 || s.plant >= PLANT_COUNT) s.plant = 0;
+            s.scale = Clampf(s.scale, POT_SCALE_MIN, POT_SCALE_MAX);
+            s.moisture = Clampf(s.moisture, 0.0f, 1.0f);
+            g_seeds.push_back(s);
+        }
+        while (*p && *p != '\n') ++p;
+    }
+}
+
+// 定时 + 退出时写盘：下次启动按这份清单恢复
+static void SaveConfig()
+{
+    HANDLE f = CreateFileW(ConfigPath().c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+
+    DWORD wr = 0;
+    const char* hdr = "# TaskbarPlant: plant x y scale moisture\r\n";
+    WriteFile(f, hdr, (DWORD)strlen(hdr), &wr, nullptr);
+
+    char dry[32];
+    int dn = sprintf(dry, "dry %d\r\n", (int)g_drySeconds);
+    WriteFile(f, dry, (DWORD)dn, &wr, nullptr);
+
+    for (size_t i = 0; i < g_pots.size(); ++i) {
+        const Pot& p = g_pots[i];
+        char line[96];
+        int n = sprintf(line, "%d %.1f %.1f %.3f %.3f\r\n",
+                        (int)p.plant, p.body.x, p.body.y, p.scale, p.moisture);
+        WriteFile(f, line, (DWORD)n, &wr, nullptr);
+    }
+    CloseHandle(f);
+}
+
+static int GetEncoderClsid(const WCHAR* mime, CLSID* clsid)
+{
+    UINT num = 0, size = 0;
+    Gdiplus::GetImageEncodersSize(&num, &size);
+    if (size == 0) return -1;
+    std::vector<BYTE> buf(size);
+    Gdiplus::ImageCodecInfo* codecs = (Gdiplus::ImageCodecInfo*)buf.data();
+    Gdiplus::GetImageEncoders(num, size, codecs);
+    for (UINT i = 0; i < num; ++i) {
+        if (wcscmp(codecs[i].MimeType, mime) == 0) { *clsid = codecs[i].Clsid; return (int)i; }
+    }
+    return -1;
+}
+
+// 把每一种植物连花盆一起画成透明 PNG，放进 exe 同目录的 Plants\ 文件夹
+static void ExportPlantImages()
+{
+    std::wstring dir = ExeDir();
+    if (dir.empty()) return;
+    dir += L"Plants";
+    CreateDirectoryW(dir.c_str(), nullptr);
+
+    CLSID png = { 0 };
+    if (GetEncoderClsid(L"image/png", &png) < 0) return;
+
+    for (int i = 0; i < PLANT_COUNT; ++i) {
+        const int w = 224;
+        const int h = (int)PlantHeight((PlantType)i) + 104;
+
+        Gdiplus::Bitmap bmp(w, h, PixelFormat32bppARGB);
+        Graphics g(&bmp);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeNone);
+        g.Clear(Color(0, 0, 0, 0));
+        g.TranslateTransform((float)w * 0.5f, (float)h - 40.0f);
+        DrawPlantLocal(g, 0.0f, (PlantType)i, 0.0f, false);
+        DrawPotLocal(g);
+
+        wchar_t file[MAX_PATH];
+        wsprintfW(file, L"%s\\%s.png", dir.c_str(), kMenuItemText[i]);
+        bmp.Save(file, &png, nullptr);
+    }
+}
+
+// 首次运行（还没导出过）自动生成一套
+static void ExportPlantsIfMissing()
+{
+    std::wstring dir = ExeDir();
+    if (dir.empty()) return;
+    std::wstring probe = dir + L"Plants\\" + kMenuItemText[0] + L".png";
+    if (GetFileAttributesW(probe.c_str()) == INVALID_FILE_ATTRIBUTES)
+        ExportPlantImages();
 }
 
 // =============================================================================
@@ -1646,17 +1937,32 @@ static void LayoutWindow()
         if (!CreateBackBuffer(g_winW, g_winH)) return;
     }
 
-    // 首次：放第一个花盆（显示器中间、任务栏上沿）
+    // 首次：恢复上次的花盆（植物 / 数量 / 位置 / 大小 / 水分）
     if (!g_layoutReady) {
-        SpawnPot((float)((m.left + m.right) / 2 - vx), g_floorY, PLANT_SUNFLOWER);
-        g_pots.back().body.vy = 0.0f;
         g_layoutReady = true;
+        if (!g_seeds.empty()) {
+            for (size_t i = 0; i < g_seeds.size(); ++i) {
+                const PotSeed& s = g_seeds[i];
+                SpawnPot(s.x, s.y, (PlantType)s.plant);
+                Pot& np = g_pots.back();
+                np.scale = s.scale;
+                np.moisture = s.moisture;
+                np.body.x = Clampf(s.x, POT_W * 0.5f * s.scale,
+                                   (float)g_winW - POT_W * 0.5f * s.scale);
+                np.body.y = Clampf(s.y, POT_H * s.scale, g_floorY);
+                np.body.vy = 0.0f;
+            }
+        } else {
+            SpawnPot((float)((m.left + m.right) / 2 - vx), g_floorY, PLANT_SUNFLOWER);
+            g_pots.back().body.vy = 0.0f;
+        }
     } else {
         // 分辨率 / 任务栏变化后把花盆夹回工作区内
         for (size_t i = 0; i < g_pots.size(); ++i) {
             Body& b = g_pots[i].body;
-            b.x = Clampf(b.x, POT_W * 0.5f, (float)g_winW - POT_W * 0.5f);
-            b.y = Clampf(b.y, POT_H, g_floorY);
+            float hw = POT_W * 0.5f * g_pots[i].scale;
+            b.x = Clampf(b.x, hw, (float)g_winW - hw);
+            b.y = Clampf(b.y, POT_H * g_pots[i].scale, g_floorY);
         }
     }
 
@@ -1722,7 +2028,7 @@ static void UpdateVisibility()
 static void WorldToLocal(const Pot& p, float wx, float wy, float& lx, float& ly)
 {
     float cx = p.body.x;
-    float cy = p.body.y - POT_H * 0.5f;
+    float cy = p.body.y - POT_H * 0.5f * p.scale;
     float dx = wx - cx;
     float dy = wy - cy;
     float c = cosf(p.body.angle);
@@ -1735,16 +2041,18 @@ static bool HitPot(const Pot& p, float wx, float wy)
 {
     float lx, ly;
     WorldToLocal(p, wx, wy, lx, ly);
-    return fabsf(lx) <= POT_W * 0.5f + 6.0f &&
-           ly >= -POT_H * 0.5f - 10.0f && ly <= POT_H * 0.5f + 4.0f;
+    return fabsf(lx) <= (POT_W * 0.5f + 6.0f) * p.scale &&
+           ly >= (-POT_H * 0.5f - 10.0f) * p.scale &&
+           ly <= (POT_H * 0.5f + 4.0f) * p.scale;
 }
 
 static bool HitPlant(const Pot& p, float wx, float wy)
 {
     float lx, ly;
     WorldToLocal(p, wx, wy, lx, ly);
-    return fabsf(lx) <= 42.0f &&
-           ly >= -POT_H * 0.5f - PlantHeight(p.plant) && ly <= -POT_H * 0.5f;
+    return fabsf(lx) <= 42.0f * p.scale &&
+           ly >= -(POT_H * 0.5f + PlantHeight(p.plant)) * p.scale &&
+           ly <= -POT_H * 0.5f * p.scale;
 }
 
 // 点到了哪个花盆（后画的在上面，所以从后往前找）
@@ -1757,10 +2065,49 @@ static int PickPot(float wx, float wy, bool wantPlant)
     return -1;
 }
 
+static void SpawnPot(float x, float y, PlantType plant);   // 定义见下
+
+// 编辑模式工具条上的四个按钮
+static void HudAction(int btn)
+{
+    switch (btn) {
+    case HUD_ADD: {
+        // 在屏幕中间附近随机撒一个新花盆
+        float cx = (float)g_winW * 0.5f + (float)((rand() % 401) - 200);
+        SpawnPot(cx, g_floorY, (PlantType)(rand() % PLANT_COUNT));
+        break;
+    }
+    case HUD_DRY: {
+        // 在几档常用时长之间循环
+        static const float kDry[] = { 30.0f, 60.0f, 120.0f, 180.0f, 300.0f };
+        const int n = (int)(sizeof(kDry) / sizeof(kDry[0]));
+        int cur = 2;                     // 默认对应 120 秒
+        for (int i = 0; i < n; ++i)
+            if (fabsf(kDry[i] - g_drySeconds) < 1.0f) { cur = i; break; }
+        g_drySeconds = kDry[(cur + 1) % n];
+        g_fullRedraw = true;
+        break;
+    }
+    case HUD_SAVE:
+        SaveConfig();                    // 只有点这里才写 ini
+        g_hudMsgTimer = 2.0f;
+        g_fullRedraw = true;
+        break;
+    case HUD_DONE:
+        g_editMode = false;
+        g_hudHot = -1;
+        g_fullRedraw = true;
+        break;
+    }
+}
+
 static void OnLButtonDown(HWND hwnd, LPARAM lp)
 {
     float mx = (float)GET_X_LPARAM(lp);
     float my = (float)GET_Y_LPARAM(lp);
+
+    int hud = HudButtonAt(mx, my);
+    if (hud >= 0) { HudAction(hud); return; }
 
     int pot = PickPot(mx, my, false);
     if (pot >= 0) {
@@ -1788,17 +2135,27 @@ static void OnLButtonDown(HWND hwnd, LPARAM lp)
 
 static void OnMouseMove(LPARAM lp)
 {
+    float mx = (float)GET_X_LPARAM(lp);
+    float my = (float)GET_Y_LPARAM(lp);
+    g_mouseX = mx;
+    g_mouseY = my;
+
+    // 编辑模式：工具条按钮悬停高亮
+    int hot = HudButtonAt(mx, my);
+    if (hot != g_hudHot) {
+        g_hudHot = hot;
+        g_fullRedraw = true;
+    }
+
     if (g_activePot < 0 || g_activePot >= (int)g_pots.size()) return;
     Pot& p = g_pots[g_activePot];
     if (!p.body.dragged && !p.poking) return;
 
-    float mx = (float)GET_X_LPARAM(lp);
-    float my = (float)GET_Y_LPARAM(lp);
-
     if (p.body.dragged) {
         // 拖拽时只受桌面四边限制，可以停在任意窗口的标题栏上方
-        float tx = Clampf(mx - p.dragOffX, POT_W * 0.5f, (float)g_winW - POT_W * 0.5f);
-        float ty = Clampf(my - p.dragOffY, POT_H, g_floorY);
+        float hw = POT_W * 0.5f * p.scale;
+        float tx = Clampf(mx - p.dragOffX, hw, (float)g_winW - hw);
+        float ty = Clampf(my - p.dragOffY, POT_H * p.scale, g_floorY);
 
         // 用相邻两帧位移估算甩出速度（限幅，避免快速拖动变成“发射炮弹”）
         float instVx = (tx - p.body.x) / DT;
@@ -1840,6 +2197,8 @@ static void SpawnPot(float x, float y, PlantType plant)
 {
     Pot p;
     ZeroMemory(&p, sizeof(Pot));
+    p.scale = 1.0f;
+    p.moisture = 1.0f;
     p.body.x = Clampf(x, POT_W * 0.5f, (float)g_winW - POT_W * 0.5f);
     p.body.y = Clampf(y, POT_H, (float)g_winH);
     p.body.vy = -160.0f;          // 放下来时轻轻一跳
@@ -1862,6 +2221,24 @@ static void ApplyMenuChoice(int idx)
         p->swayVel = 3.0f;                  // 换植物时晃一下
         p->body.vy = -90.0f;                // 轻轻一跳
         g_fullRedraw = true;
+    } else if (idx == MENU_CMD_WATER) {
+        if (p) {
+            p->waterAnim = WATER_DURATION;
+            p->swayVel = 2.2f;
+            g_fullRedraw = true;
+        }
+    } else if (idx == MENU_CMD_EDIT) {
+        g_editMode = !g_editMode;
+        g_hudHot = -1;
+        g_hudMsgTimer = 0.0f;
+        g_fullRedraw = true;
+    } else if (idx == MENU_CMD_SCALE_UP || idx == MENU_CMD_SCALE_DOWN) {
+        if (p) {
+            float ns = p->scale + ((idx == MENU_CMD_SCALE_UP) ? POT_SCALE_STEP : -POT_SCALE_STEP);
+            p->scale = Clampf(ns, POT_SCALE_MIN, POT_SCALE_MAX);
+            p->body.vy = -90.0f;
+            g_fullRedraw = true;
+        }
     } else if (idx == MENU_CMD_SPAWN) {
         SpawnPot(g_spawnX, g_spawnY, p ? p->plant : PLANT_SUNFLOWER);
     } else if (idx == MENU_CMD_REMOVE) {
@@ -1870,6 +2247,8 @@ static void ApplyMenuChoice(int idx)
             g_activePot = -1;
             g_fullRedraw = true;
         }
+    } else if (idx == MENU_CMD_EXPORT) {
+        ExportPlantImages();
     } else if (idx == MENU_CMD_QUIT) {
         PostMessageW(g_hwnd, WM_CLOSE, 0, 0);   // 回到消息循环后再退出，避免在本窗口过程里销毁自己
     }
@@ -1929,6 +2308,11 @@ static void PaintMenu(HWND hwnd)
         RGB(212, 58, 46),   // 辣椒
         RGB(240, 240, 226)  // 蒲公英
     };
+    // 命令项的代表色：浇水 / 编辑 / 调大 / 调小 / 放置 / 移除 / 导出 / 退出
+    static const COLORREF kCmdDots[MENU_ITEM_COUNT - PLANT_COUNT] = {
+        RGB(92, 176, 232), RGB(180, 170, 120), RGB(196, 148, 92), RGB(150, 112, 72),
+        RGB(120, 170, 110), RGB(190, 90, 80), RGB(96, 150, 190), RGB(130, 130, 130)
+    };
 
     for (int i = 0; i < kMenuCount; ++i) {
         RECT row;
@@ -1944,7 +2328,7 @@ static void PaintMenu(HWND hwnd)
         }
 
         // 左侧小色块，代替图标
-        COLORREF dot = (i < PLANT_COUNT) ? kDots[i] : RGB(150, 150, 150);
+        COLORREF dot = (i < PLANT_COUNT) ? kDots[i] : kCmdDots[i - PLANT_COUNT];
         RECT dotRc = { row.left + 10, row.top + 12, row.left + 22, row.top + 24 };
         HBRUSH db = CreateSolidBrush(dot);
         FillRect(dc, &dotRc, db);
@@ -2065,7 +2449,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case TIMER_ANIM:
             g_time += DT;
             UpdatePhysics(DT);
+            if (g_hudMsgTimer > 0.0f) {
+                g_hudMsgTimer -= DT;
+                if (g_hudMsgTimer <= 0.0f) {
+                    g_hudMsgTimer = 0.0f;
+                    g_fullRedraw = true;
+                }
+            }
             Present();
+            // 编辑模式下改动只在内存里，点“保存”才写盘
+            g_saveTimer += DT;
+            if (!g_editMode && g_saveTimer >= 5.0f) {
+                g_saveTimer = 0.0f;
+                SaveConfig();
+            }
             break;
         case TIMER_FULL:
             UpdateVisibility();
@@ -2172,8 +2569,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
         nullptr, nullptr, hInstance, nullptr);
     if (!g_hwnd) return 1;
 
+    LoadConfig();                   // 读上次的花盆清单（植物 / 数量 / 位置 / 大小 / 水分）
     LayoutWindow();                 // 铺满工作区（任务栏以上）+ 计算地面 + 建离屏缓冲
     if (!g_bits) return 1;
+    ExportPlantsIfMissing();        // 首次运行自动导出每种植物的 PNG 到 Plants\
 
     g_menuFont = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -2195,6 +2594,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
     }
 
     if (g_menuFont) DeleteObject(g_menuFont);
+    if (!g_editMode) SaveConfig();   // 退出前存一次（编辑模式里没保存的改动不写盘）
     DestroyBackBuffer();
     Gdiplus::GdiplusShutdown(g_gdipToken);
     return (int)msg.wParam;

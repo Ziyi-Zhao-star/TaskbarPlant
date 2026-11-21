@@ -1,0 +1,8 @@
+# 运行时生成
+TaskbarPlant.ini
+Plants/
+
+# 本机快捷方式 / 构建中间产物
+*.lnk
+*.o
+*.obj
