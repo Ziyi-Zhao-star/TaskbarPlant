@@ -7,8 +7,6 @@
 Windows 桌面上的一盆「电子盆栽」：单个 C++ 文件、无第三方依赖，编译出来就是一个 exe。
 透明的悬浮层铺在任务栏以上的整个工作区，花盆会从桌面或窗口标题栏上掉下来，可以拖动、抛出、浇水、养多盆。
 
-<img width="662" height="268" alt="{7CA23EAA-E318-41C0-961C-B40CE43E0179}" src="https://github.com/user-attachments/assets/5811fa77-30fe-4f21-8502-620b796a2a29" />
-
 > 直接下载：[Releases](https://github.com/Ziyi-Zhao-star/TaskbarPlant/releases) → `TaskbarPlant.exe`，双击即用，无需安装。
 
 ## 植物图鉴
