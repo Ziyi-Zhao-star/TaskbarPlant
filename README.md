@@ -1,0 +1,28 @@
+# TaskbarPlant 桌面电子盆栽
+
+Windows 桌面上的一盆「电子盆栽」：单个 C++ 文件、无第三方依赖，编译出来就是一个 exe。
+<img width="662" height="268" alt="{7CA23EAA-E318-41C0-961C-B40CE43E0179}" src="https://github.com/user-attachments/assets/5811fa77-30fe-4f21-8502-620b796a2a29" />
+
+## 功能
+
+- 花盆会从桌面（或窗口标题栏）上掉下来，带重力、晃动和土层淡出效果
+- 鼠标左键可以抓起花盆拖动、抛出
+- 右键花盆：换植物、再养一盆、移除
+- 悬浮层是逐像素透明的，透明区域鼠标点击直接穿透
+- 窗口只铺任务栏以上的工作区，不会遮挡任务栏
+
+## 环境
+
+- Windows 10 / 11
+- MinGW-w64 g++ 或 Visual Studio（MSVC），需要 C++17
+
+## 编译
+
+双击 `build.bat` 即可（自动查找 MinGW g++，找不到再找 MSVC cl），
+也可以手动执行：
+
+## 你在找Linux版吗？
+
+我的朋友已经移植好了，在https://github.com/Epiphany106-blip/taskbarplant-linux
+- 记得给他点个star
+
