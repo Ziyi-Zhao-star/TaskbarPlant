@@ -1,6 +1,6 @@
 # TaskbarPlant 桌面电子盆栽（记得看看最后！）
 
-![version](https://img.shields.io/badge/version-v2.0.0-c98a4b)
+![version](https://img.shields.io/badge/version-v3.0.0-c98a4b)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-4e9a4e)
 ![language](https://img.shields.io/badge/C%2B%2B-17-00599c)
 
@@ -139,8 +139,9 @@ cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE TaskbarPlant.cpp ^
 
 ## 版本
 
-当前版本：**v2.0.0**
+当前版本：**v3.0.0**
 
+- `v3.0.0`：修复导出的植物图片顶部被裁切、根部陷进盆身的问题（画布按植株实际高度计算）
 - `v2.0.0`：编辑模式（花盆数量 / 位置 / 大小、可调干枯时间、点保存才写 ini）、枯叶掉落物理、移除水滴图标、13 种植物、水分与浇水动画、ini 持久化
 - 更新日志与下载：[Releases](https://github.com/Ziyi-Zhao-star/TaskbarPlant/releases)
 
