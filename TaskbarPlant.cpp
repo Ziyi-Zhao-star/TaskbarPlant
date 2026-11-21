@@ -127,8 +127,11 @@ static const wchar_t* kMenuItemText[MENU_ITEM_COUNT] = {
     L"放置新花盆", L"移除这个花盆", L"导出植物图片", L"退出程序"
 };
 static const int kMenuCount = MENU_ITEM_COUNT;
-static const int kMenuW = 178;
-static const int kMenuRowH = 34;
+static const int kMenuW = 246;                            // 植物区双栏 + 命令区单栏
+static const int kMenuColW = (kMenuW - 16) / 2;           // 植物格子宽度
+static const int kPlantRows = (PLANT_COUNT + 1) / 2;      // 植物按两列排
+static const int kMenuRowH = 30;
+static const int kMenuSepH = 12;                          // 植物区与命令区之间的分隔带
 static const int kMenuPad = 8;
 
 // 花盆刚体：b.y 表示“花盆底部中心”的 y，angle 绕花盆几何中心旋转
@@ -1866,16 +1869,6 @@ static void ExportPlantImages()
     }
 }
 
-// 首次运行（还没导出过）自动生成一套
-static void ExportPlantsIfMissing()
-{
-    std::wstring dir = ExeDir();
-    if (dir.empty()) return;
-    std::wstring probe = dir + L"Plants\\" + kMenuItemText[0] + L".png";
-    if (GetFileAttributesW(probe.c_str()) == INVALID_FILE_ATTRIBUTES)
-        ExportPlantImages();
-}
-
 // =============================================================================
 //  四、铺满工作区（不碰任务栏）/ 计算地面 / 智能隐藏
 // =============================================================================
@@ -2262,14 +2255,48 @@ static void ApplyMenuChoice(int idx)
 //  六、像素风右键菜单
 // =============================================================================
 
+// 命令区起始 y（植物区 + 分隔带之后）
+static inline int MenuCmdTop()
+{
+    return kMenuPad + kPlantRows * kMenuRowH + kMenuSepH;
+}
+
+static int MenuHeight()
+{
+    return MenuCmdTop() + (MENU_ITEM_COUNT - PLANT_COUNT) * kMenuRowH + kMenuPad;
+}
+
+// 菜单项矩形：植物两列排，命令单列排
+static void MenuItemRect(int idx, RECT& r)
+{
+    if (idx < PLANT_COUNT) {
+        int row = idx / 2;
+        int col = idx % 2;
+        r.left = kMenuPad + col * kMenuColW;
+        r.right = r.left + kMenuColW - 4;
+        r.top = kMenuPad + row * kMenuRowH;
+        r.bottom = r.top + kMenuRowH - 2;
+    } else {
+        int c = idx - PLANT_COUNT;
+        r.left = kMenuPad;
+        r.right = kMenuW - kMenuPad;
+        r.top = MenuCmdTop() + c * kMenuRowH;
+        r.bottom = r.top + kMenuRowH - 2;
+    }
+}
+
 static int MenuItemFromPoint(LPARAM lp)
 {
-    int x = GET_X_LPARAM(lp);
-    int y = GET_Y_LPARAM(lp);
-    if (x < kMenuPad || x > kMenuW - kMenuPad) return -1;
-    int idx = (y - kMenuPad) / kMenuRowH;
-    if (idx < 0 || idx >= kMenuCount) return -1;
-    return idx;
+    POINT p;
+    p.x = GET_X_LPARAM(lp);
+    p.y = GET_Y_LPARAM(lp);
+    for (int i = 0; i < kMenuCount; ++i) {
+        RECT r;
+        MenuItemRect(i, r);
+        r.bottom += 2;              // 把行间隙也算进命中区
+        if (PtInRect(&r, p)) return i;
+    }
+    return -1;
 }
 
 static void PaintMenu(HWND hwnd)
@@ -2318,12 +2345,21 @@ static void PaintMenu(HWND hwnd)
         RGB(120, 170, 110), RGB(190, 90, 80), RGB(96, 150, 190), RGB(130, 130, 130)
     };
 
+    // 植物区与命令区之间的一条分隔线
+    {
+        RECT sep;
+        sep.left = kMenuPad;
+        sep.right = kMenuW - kMenuPad;
+        sep.top = MenuCmdTop() - kMenuSepH / 2 - 1;
+        sep.bottom = sep.top + 2;
+        HBRUSH sb = CreateSolidBrush(RGB(96, 64, 40));
+        FillRect(dc, &sep, sb);
+        DeleteObject(sb);
+    }
+
     for (int i = 0; i < kMenuCount; ++i) {
         RECT row;
-        row.left = kMenuPad;
-        row.right = kMenuW - kMenuPad;
-        row.top = kMenuPad + i * kMenuRowH;
-        row.bottom = row.top + kMenuRowH - 2;
+        MenuItemRect(i, row);
 
         if (i == g_menuHover) {
             HBRUSH hb = CreateSolidBrush(RGB(122, 74, 42));
@@ -2333,13 +2369,13 @@ static void PaintMenu(HWND hwnd)
 
         // 左侧小色块，代替图标
         COLORREF dot = (i < PLANT_COUNT) ? kDots[i] : kCmdDots[i - PLANT_COUNT];
-        RECT dotRc = { row.left + 10, row.top + 12, row.left + 22, row.top + 24 };
+        RECT dotRc = { row.left + 8, row.top + 7, row.left + 20, row.top + 19 };
         HBRUSH db = CreateSolidBrush(dot);
         FillRect(dc, &dotRc, db);
         DeleteObject(db);
 
         RECT textRc = row;
-        textRc.left += 32;
+        textRc.left += 28;
         SetTextColor(dc, (i == g_menuHover) ? RGB(255, 240, 210) : RGB(216, 188, 152));
         DrawTextW(dc, kMenuItemText[i], -1, &textRc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
     }
@@ -2410,7 +2446,7 @@ static void ShowPlantMenu(HWND owner, LPARAM lp)
     pt.y = GET_Y_LPARAM(lp);
     ClientToScreen(owner, &pt);
 
-    int h = kMenuRowH * kMenuCount + kMenuPad * 2;
+    int h = MenuHeight();
     int x = pt.x - kMenuW;          // 开在光标左上方
     int y = pt.y - h - 6;
 
@@ -2576,7 +2612,6 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
     LoadConfig();                   // 读上次的花盆清单（植物 / 数量 / 位置 / 大小 / 水分）
     LayoutWindow();                 // 铺满工作区（任务栏以上）+ 计算地面 + 建离屏缓冲
     if (!g_bits) return 1;
-    ExportPlantsIfMissing();        // 首次运行自动导出每种植物的 PNG 到 Plants\
 
     g_menuFont = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
