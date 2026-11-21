@@ -1,6 +1,7 @@
 # TaskbarPlant 桌面电子盆栽
 
 Windows 桌面上的一盆「电子盆栽」：单个 C++ 文件、无第三方依赖，编译出来就是一个 exe。
+<img width="662" height="268" alt="{7CA23EAA-E318-41C0-961C-B40CE43E0179}" src="https://github.com/user-attachments/assets/5811fa77-30fe-4f21-8502-620b796a2a29" />
 
 ## 功能
 
