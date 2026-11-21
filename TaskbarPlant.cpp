@@ -11,7 +11,7 @@
 //    2. 物理边界不再是 380x280 的小窗口，而是任务栏以上的整块工作区；默认地面是任务栏上沿，
 //       花盆掉到任意窗口的标题栏上时会被标题栏“接住”。
 //    3. 自写物理：重力、地面碰撞、弹跳、旋转、拖拽甩出、落地扬尘。
-//    4. 右键弹出自绘的像素风菜单：可切换 9 种植物、放置新花盆、移除花盆；
+//    4. 右键弹出自绘的像素风菜单：可切换 13 种植物、放置新花盆、移除花盆；
 //       每个花盆都是独立刚体，可以同时养很多盆。
 //    5. 定时器轮询前台窗口，若其覆盖整个显示器（全屏视频/游戏）则 SW_HIDE，
 //       结束后 SW_SHOWNA 恢复（不抢焦点）。
@@ -90,6 +90,10 @@ enum PlantType {
     PLANT_SUCCULENT,
     PLANT_BAMBOO,
     PLANT_ROSE,
+    PLANT_LAVENDER,
+    PLANT_CLOVER,
+    PLANT_CHILI,
+    PLANT_DANDELION,
     PLANT_COUNT
 };
 
@@ -104,6 +108,7 @@ enum MenuCmd {
 static const wchar_t* kMenuItemText[MENU_ITEM_COUNT] = {
     L"仙人掌", L"向日葵", L"食人花", L"郁金香", L"蘑菇",
     L"小松树", L"多肉", L"竹子", L"玫瑰",
+    L"薰衣草", L"三叶草", L"辣椒", L"蒲公英",
     L"放置新花盆", L"移除这个花盆", L"退出程序"
 };
 static const int kMenuCount = MENU_ITEM_COUNT;
@@ -736,6 +741,193 @@ static void DrawRose(Graphics& g, float soilY, float sway, float t)
     g.Restore(st);
 }
 
+// 薰衣草：三根细茎，顶端各顶一串紫色小花
+static void DrawLavender(Graphics& g, float soilY, float sway, float t)
+{
+    SolidBrush stem(C(88, 146, 68));
+    SolidBrush leaf(C(104, 166, 84));
+    SolidBrush leafDark(C(72, 130, 58));
+    SolidBrush budA(C(152, 106, 202));
+    SolidBrush budB(C(116, 74, 170));
+    SolidBrush budLight(C(198, 160, 236));
+
+    struct Spike { float x, h, ph; };
+    const Spike spikes[3] = {
+        { -14.0f,  96.0f, 0.0f },
+        {   2.0f, 124.0f, 1.1f },
+        {  16.0f,  82.0f, 2.2f }
+    };
+
+    GraphicsState st = g.Save();
+    g.TranslateTransform(0.0f, SnapPx(soilY));
+
+    // 贴地两片细叶
+    DrawPixelLeaf(g, -2.0f,  0.0f, -1, 24.0f, 28.0f, 6.0f, &leaf, nullptr);
+    DrawPixelLeaf(g,  2.0f, -4.0f, +1, 20.0f, 26.0f, 6.0f, &leafDark, nullptr);
+
+    for (int i = 0; i < 3; ++i) {
+        const Spike& s = spikes[i];
+        int   rows = (int)floorf(s.h / PIX + 0.5f);
+        float bend = sway * 14.0f + sinf(t * 0.9f + s.ph) * 2.0f;
+
+        // 茎：4px 宽，逐格往上，越靠上弯得越多
+        for (int r = 0; r < rows; ++r) {
+            float k  = (float)r / (float)rows;
+            float dx = SnapPx(s.x + bend * k * k);
+            FillRectF(g, &stem, dx - PIX * 0.5f, -(float)(r + 1) * PIX, PIX, PIX);
+        }
+
+        // 花穗：茎尖往上堆 5 格，奇偶行左右错开半格
+        float tipX = SnapPx(s.x + bend);
+        float tipY = -(float)rows * PIX;
+        for (int j = 0; j < 5; ++j) {
+            float  y    = tipY - (float)(j + 1) * PIX;
+            Brush* main = (j & 1) ? (Brush*)&budB : (Brush*)&budA;
+            float  off  = (j & 1) ? PIX * 0.5f : -PIX * 0.5f;
+            FillRectF(g, main,        tipX - PIX * 1.5f + off, y, PIX * 3.0f, PIX);
+            FillRectF(g, &budLight,   tipX - PIX * 1.5f + off, y, PIX, PIX);
+        }
+        FillRectF(g, &budB, tipX - PIX * 0.5f, tipY - 6.0f * PIX, PIX, PIX);
+    }
+
+    g.Restore(st);
+}
+
+// 三叶草：三片心形像素叶，每片都是一格一格拼出来的
+static void DrawClover(Graphics& g, float soilY, float sway, float t)
+{
+    SolidBrush stem(C(78, 140, 60));
+    SolidBrush leafA(C(96, 176, 76));
+    SolidBrush leafB(C(70, 146, 58));
+    SolidBrush leafLight(C(140, 208, 108));
+
+    GraphicsState st = g.Save();
+    g.TranslateTransform(0.0f, SnapPx(soilY));
+    g.RotateTransform(sway * 6.0f + sinf(t * 0.8f) * 1.2f);
+
+    const float h = 52.0f;
+    FillRectF(g, &stem, -PIX * 0.5f, -h, PIX, h);
+    FillRectF(g, &stem, -PIX * 2.0f, -h - PIX, PIX * 4.0f, PIX);   // 叶柄分叉
+
+    // 心形叶：7 格宽 / 6 格高，顶行中间留缺口
+    struct LeafPos { float cx, cy; };
+    const LeafPos pos[3] = {
+        { -16.0f, -h - 10.0f },
+        {   0.0f, -h - 18.0f },
+        {  16.0f, -h - 10.0f }
+    };
+    // 每一行：起始格、格数（以中心为 0 格）
+    const int rowStart[6] = { -3, -3, -3, -2, -1, 0 };
+    const int rowCount[6] = {  2,  7,  7,  5,  3, 1 };
+    for (int i = 0; i < 3; ++i) {
+        float cx = SnapPx(pos[i].cx + sway * 4.0f);
+        float cy = SnapPx(pos[i].cy);
+        for (int r = 0; r < 6; ++r) {
+            float y = cy + (float)r * PIX;
+            if (r == 0) {
+                // 顶行两个叶瓣，中间断开
+                FillRectF(g, &leafA, cx - 3 * PIX, y, 2 * PIX, PIX);
+                FillRectF(g, &leafA, cx + 1 * PIX, y, 2 * PIX, PIX);
+                continue;
+            }
+            Brush* br = (i & 1) ? (Brush*)&leafB : (Brush*)&leafA;
+            FillRectF(g, br, cx + (float)rowStart[r] * PIX, y,
+                      (float)rowCount[r] * PIX, PIX);
+        }
+        // 叶脉高光
+        FillRectF(g, &leafLight, cx - PIX * 0.5f, cy + PIX, PIX, PIX * 2.0f);
+    }
+
+    g.Restore(st);
+}
+
+// 辣椒：矮灌木 + 三只垂下来的红辣椒
+static void DrawChili(Graphics& g, float soilY, float sway, float t)
+{
+    SolidBrush stem(C(84, 142, 60));
+    SolidBrush leaf(C(92, 168, 72));
+    SolidBrush leafDark(C(64, 126, 52));
+    SolidBrush pod(C(212, 58, 46));
+    SolidBrush podDark(C(158, 34, 30));
+    SolidBrush podLight(C(244, 118, 92));
+
+    GraphicsState st = g.Save();
+    g.TranslateTransform(0.0f, SnapPx(soilY));
+    g.RotateTransform(sway * 6.0f + sinf(t * 0.7f) * 1.0f);
+
+    const float h = 84.0f;
+    FillRectF(g, &stem, -PIX * 0.5f, -h - 8.0f, PIX, h + 8.0f);
+
+    // 枝叶
+    DrawPixelLeaf(g, -2.0f, -h * 0.55f, -1, 24.0f, 24.0f, 6.0f, &leaf, nullptr);
+    DrawPixelLeaf(g,  2.0f, -h * 0.72f, +1, 22.0f, 24.0f, 6.0f, &leafDark, nullptr);
+    DrawPixelLeaf(g, -2.0f, -h * 0.90f, -1, 18.0f, 20.0f, 6.0f, &leafDark, nullptr);
+    DrawPixelLeaf(g,  2.0f, -h * 0.98f, +1, 16.0f, 20.0f, 6.0f, &leaf, nullptr);
+
+    // 辣椒：8px 宽的红条垂下，尾端收成 4px 尖
+    struct Pod { float x, top, len; };
+    const Pod pods[3] = {
+        { -14.0f, -h * 0.50f, 22.0f },
+        {  12.0f, -h * 0.62f, 26.0f },
+        {   0.0f, -h * 0.78f, 20.0f }
+    };
+    for (int i = 0; i < 3; ++i) {
+        float x   = SnapPx(pods[i].x + sway * 5.0f);
+        float top = SnapPx(pods[i].top);
+        int   rows = (int)floorf(pods[i].len / PIX + 0.5f);
+        for (int r = 0; r < rows; ++r) {
+            float y = top + (float)r * PIX;
+            FillRectF(g, &pod,      x - PIX, y, PIX * 2.0f, PIX);
+            FillRectF(g, &podDark,  x + PIX * 0.5f, y, PIX * 0.5f, PIX);
+            FillRectF(g, &podLight, x - PIX, y, PIX * 0.5f, PIX);
+        }
+        FillRectF(g, &pod, x - PIX * 0.5f, top + (float)rows * PIX, PIX, PIX);
+        FillRectF(g, &leafDark, x - PIX * 1.5f, top - PIX, PIX * 3.0f, PIX);  // 蒂
+    }
+
+    g.Restore(st);
+}
+
+// 蒲公英：细茎顶着一颗白色绒球，旁边飘走一颗种子
+static void DrawDandelion(Graphics& g, float soilY, float sway, float t)
+{
+    SolidBrush stem(C(122, 158, 82));
+    SolidBrush stemDark(C(94, 128, 62));
+    SolidBrush leaf(C(104, 170, 78));
+    SolidBrush puffShade(C(206, 212, 200));
+    SolidBrush puff(C(246, 246, 238));
+    SolidBrush fly(C(255, 255, 250));
+
+    GraphicsState st = g.Save();
+    g.TranslateTransform(0.0f, SnapPx(soilY));
+    g.RotateTransform(sway * 8.0f + sinf(t * 1.0f) * 2.0f);
+
+    const float h = 104.0f;
+    FillRectF(g, &stem,     -PIX,  -h, PIX * 2.0f, h);
+    FillRectF(g, &stemDark,  PIX,  -h, PIX, h);
+
+    // 贴地叶片
+    DrawPixelLeaf(g, -2.0f,  0.0f, -1, 26.0f, 30.0f, 6.0f, &leaf, nullptr);
+    DrawPixelLeaf(g,  2.0f, -6.0f, +1, 22.0f, 26.0f, 6.0f, &leaf, nullptr);
+
+    // 绒球：两层像素圆 + 外圈八颗绒毛
+    const float cx = 0.0f, cy = -h - 12.0f;
+    FillPixelEllipse(g, &puffShade, cx, cy, 20.0f, 20.0f);
+    FillPixelEllipse(g, &puff,      cx, cy, 16.0f, 16.0f);
+    for (int i = 0; i < 8; ++i) {
+        float a = (float)i * PI_F / 4.0f;
+        FillRectF(g, &puff, SnapPx(cx + cosf(a) * 22.0f) - PIX * 0.5f,
+                          SnapPx(cy + sinf(a) * 22.0f) - PIX * 0.5f, PIX, PIX);
+    }
+
+    // 飘走的种子
+    float fx = 28.0f + sinf(t * 0.9f) * 6.0f;
+    float fy = cy - 26.0f + cosf(t * 0.7f) * 4.0f;
+    FillRectF(g, &fly, SnapPx(fx), SnapPx(fy), PIX, PIX);
+
+    g.Restore(st);
+}
+
 static float PlantHeight(PlantType t)
 {
     switch (t) {
@@ -748,6 +940,10 @@ static float PlantHeight(PlantType t)
     case PLANT_SUCCULENT: return 64.0f;
     case PLANT_BAMBOO:    return 158.0f;
     case PLANT_ROSE:      return 132.0f;
+    case PLANT_LAVENDER:  return 152.0f;
+    case PLANT_CLOVER:    return 88.0f;
+    case PLANT_CHILI:     return 128.0f;
+    case PLANT_DANDELION: return 148.0f;
     default:              return 110.0f;
     }
 }
@@ -778,6 +974,18 @@ static void DrawPlantLocal(Graphics& g, float soilY, PlantType t, float sway, bo
         break;
     case PLANT_ROSE:
         DrawRose(g, soilY, sway, g_time);
+        break;
+    case PLANT_LAVENDER:
+        DrawLavender(g, soilY, sway, g_time);
+        break;
+    case PLANT_CLOVER:
+        DrawClover(g, soilY, sway, g_time);
+        break;
+    case PLANT_CHILI:
+        DrawChili(g, soilY, sway, g_time);
+        break;
+    case PLANT_DANDELION:
+        DrawDandelion(g, soilY, sway, g_time);
         break;
     case PLANT_SUNFLOWER:
     default:
@@ -1136,9 +1344,12 @@ static void SpriteBounds(RectI& rc)
         const float cx = p.body.x;
         const float cy = p.body.y - hh;          // 旋转中心（花盆几何中心）
 
-        // 精灵在“花盆局部坐标”里的外框：上面是植物（含摆动量），下面是盆底
-        const float halfW = 104.0f;
-        const float topY  = -(PlantHeight(p.plant) + 34.0f);
+        // 精灵在“花盆局部坐标”里的外框：上面是植物（含摆动量），下面是盆底。
+        // 余量必须给足：玫瑰的花苞绕茎尖旋转后，顶点比 PlantHeight 还高一截，
+        // 蒲公英的绒球也顶得很高。超出包围盒的像素不会被 ClearRect 擦掉，
+        // 留在缓冲里就成了“拖影”。
+        const float halfW = 112.0f;
+        const float topY  = -(PlantHeight(p.plant) + 80.0f);
         const float botY  = hh + 10.0f;
 
         // 按当前角度把四个角转到屏幕坐标再取轴对齐包围盒。
@@ -1217,6 +1428,75 @@ static void PremultiplyRect(const RectI& rc)
     }
 }
 
+// 纯像素风后处理：把绘制结果压进 4x4 像素格。
+// GDI+ 画的方块在旋转/位移后会落在非整数像素上，边缘出现 1px 宽的碎边；
+// 这里按格重采样，让所有轮廓都变成整齐的方块：
+//   · 格内实心像素过半      → 整格填成实心色块
+//   · 只有零星实心像素      → 保留最靠近格心的那个像素颜色，轮廓断口被补齐
+//   · 没有实心像素但有半透明（投影）→ 整格压成同透明度的色块
+//   · 其余                  → 整格清空
+static void PixelateRect(const RectI& rc)
+{
+    int l = rc.l < 0 ? 0 : rc.l;
+    int t = rc.t < 0 ? 0 : rc.t;
+    int r = rc.r > g_winW ? g_winW : rc.r;
+    int b = rc.b > g_winH ? g_winH : rc.b;
+    const int cell = (int)PIX;
+
+    for (int y = t; y < b; y += cell) {
+        int y1 = y + cell; if (y1 > b) y1 = b;
+        for (int x = l; x < r; x += cell) {
+            int x1 = x + cell; if (x1 > r) x1 = r;
+
+            const int total = (y1 - y) * (x1 - x);
+            int solid = 0, semi = 0;
+            unsigned maxA = 0;
+            unsigned char maxR = 0, maxG = 0, maxB = 0;
+            int bestDist = 1 << 30;
+            unsigned char cenR = 0, cenG = 0, cenB = 0;
+            const int ccx = (x + x1) >> 1;
+            const int ccy = (y + y1) >> 1;
+
+            for (int yy = y; yy < y1; ++yy) {
+                const unsigned char* p = (const unsigned char*)g_bits
+                                       + ((size_t)yy * (size_t)g_winW + (size_t)x) * 4;
+                for (int xx = x; xx < x1; ++xx, p += 4) {
+                    unsigned a = p[3];
+                    if (a >= 128) {
+                        ++solid;
+                        int dxp = xx - ccx, dyp = yy - ccy;
+                        int d = dxp * dxp + dyp * dyp;
+                        if (d < bestDist) {
+                            bestDist = d;
+                            cenB = p[0]; cenG = p[1]; cenR = p[2];
+                        }
+                    } else if (a > 0) {
+                        ++semi;
+                    }
+                    if (a > maxA) { maxA = a; maxB = p[0]; maxG = p[1]; maxR = p[2]; }
+                }
+            }
+
+            unsigned char outA, outR, outG, outB;
+            if (solid > 0) {
+                outA = 255; outR = cenR; outG = cenG; outB = cenB;
+            } else if (semi * 4 >= total) {
+                outA = (unsigned char)maxA; outR = maxR; outG = maxG; outB = maxB;
+            } else {
+                outA = 0; outR = outG = outB = 0;
+            }
+
+            for (int yy = y; yy < y1; ++yy) {
+                unsigned char* p = (unsigned char*)g_bits
+                                 + ((size_t)yy * (size_t)g_winW + (size_t)x) * 4;
+                for (int xx = x; xx < x1; ++xx, p += 4) {
+                    p[0] = outB; p[1] = outG; p[2] = outR; p[3] = outA;
+                }
+            }
+        }
+    }
+}
+
 static void Present()
 {
     if (!g_hwnd || !g_visible || !g_bits || g_winW <= 0 || g_winH <= 0) return;
@@ -1244,6 +1524,15 @@ static void Present()
     if (rc.r > g_winW) rc.r = g_winW;
     if (rc.b > g_winH) rc.b = g_winH;
 
+    // 脏矩形向外对齐到像素格，像素化后格子边界才不会出现半格
+    const int pix = (int)PIX;
+    rc.l = (rc.l / pix) * pix;
+    rc.t = (rc.t / pix) * pix;
+    rc.r = ((rc.r + pix - 1) / pix) * pix;
+    rc.b = ((rc.b + pix - 1) / pix) * pix;
+    if (rc.r > g_winW) rc.r = g_winW;
+    if (rc.b > g_winH) rc.b = g_winH;
+
     ClearRect(rc);
 
     {
@@ -1255,6 +1544,7 @@ static void Present()
         if (g_floorY > 0.0f) gfx.SetClip(RectF(0.0f, 0.0f, (float)g_winW, g_floorY));
         DrawScene(gfx);
     }
+    PixelateRect(rc);          // 压成 4px 方块，纯像素风
     PremultiplyRect(rc);
 
     POINT src = { 0, 0 };
@@ -1633,7 +1923,11 @@ static void PaintMenu(HWND hwnd)
         RGB(46, 116, 66),   // 小松树
         RGB(126, 180, 134), // 多肉
         RGB(150, 194, 96),  // 竹子
-        RGB(206, 52, 78)    // 玫瑰
+        RGB(206, 52, 78),   // 玫瑰
+        RGB(152, 106, 202), // 薰衣草
+        RGB(96, 176, 76),   // 三叶草
+        RGB(212, 58, 46),   // 辣椒
+        RGB(240, 240, 226)  // 蒲公英
     };
 
     for (int i = 0; i < kMenuCount; ++i) {
