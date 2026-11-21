@@ -23,3 +23,5 @@ Windows 桌面上的一盆「电子盆栽」：单个 C++ 文件、无第三方�
 ## 你在找Linux版吗？
 
 我的朋友已经移植好了，在https://github.com/Epiphany106-blip/taskbarplant-linux
+记得给他点个star
+
