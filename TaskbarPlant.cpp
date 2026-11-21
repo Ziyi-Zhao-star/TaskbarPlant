@@ -1845,15 +1845,19 @@ static void ExportPlantImages()
     if (GetEncoderClsid(L"image/png", &png) < 0) return;
 
     for (int i = 0; i < PLANT_COUNT; ++i) {
-        const int w = 224;
-        const int h = (int)PlantHeight((PlantType)i) + 104;
+        // 画布必须装得下整株植物：植株站在盆口，且玫瑰的花苞绕茎尖旋转后会高过 PlantHeight
+        const float plantTop = POT_H * 0.5f - 3.0f + PlantHeight((PlantType)i) + 80.0f;
+        const int   w = 224;
+        const float originY = 16.0f + plantTop;                      // 图像顶部到盆心的距离
+        const int   h = (int)(originY + POT_H * 0.5f + 16.0f);       // 底部留出盆身 + 边距
 
         Gdiplus::Bitmap bmp(w, h, PixelFormat32bppARGB);
         Graphics g(&bmp);
         g.SetSmoothingMode(Gdiplus::SmoothingModeNone);
         g.Clear(Color(0, 0, 0, 0));
-        g.TranslateTransform((float)w * 0.5f, (float)h - 40.0f);
-        DrawPlantLocal(g, 0.0f, (PlantType)i, 0.0f, false);
+        g.TranslateTransform((float)w * 0.5f, originY);
+        // 和游戏内一致：植株根部落在盆口，不能陷进盆身里
+        DrawPlantLocal(g, -POT_H * 0.5f + 3.0f, (PlantType)i, 0.0f, false);
         DrawPotLocal(g);
 
         wchar_t file[MAX_PATH];
