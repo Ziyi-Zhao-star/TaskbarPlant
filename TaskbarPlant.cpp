@@ -198,7 +198,7 @@ static std::vector<WiltParticle> g_wilt;
 
 // 编辑模式：此时改动只在内存里，点“保存”才写入 ini
 static bool  g_editMode = false;
-static float g_drySeconds = 120.0f;      // 干枯时间（秒），可在编辑模式里改
+static float g_drySeconds = 1800.0f;     // 干枯时间（秒），默认 30 分钟，可在编辑模式里改
 static float g_hudMsgTimer = 0.0f;       // “已保存”提示
 static int   g_hudHot = -1;              // 悬停的按钮
 
@@ -1628,7 +1628,11 @@ static void DrawEditHud(Graphics& g)
     }
 
     wchar_t dry[64];
-    wsprintfW(dry, L"干枯 %d 秒", (int)g_drySeconds);
+    int ds = (int)g_drySeconds;
+    if (ds >= 60 && ds % 60 == 0)
+        wsprintfW(dry, L"干枯 %d 分钟", ds / 60);
+    else
+        wsprintfW(dry, L"干枯 %d 秒", ds);
     const wchar_t* labels[HUD_BTN_COUNT] = {
         L"+ 新花盆", dry,
         (g_hudMsgTimer > 0.0f ? L"已保存" : L"保存"), L"完成"
@@ -1780,7 +1784,7 @@ static void LoadConfig()
         if (strncmp(p, "dry", 3) == 0) {
             float d = g_drySeconds;
             if (sscanf(p + 3, "%f", &d) == 1)
-                g_drySeconds = Clampf(d, 10.0f, 3600.0f);
+                g_drySeconds = Clampf(d, 60.0f, 86400.0f);
             while (*p && *p != '\n') ++p;
             continue;
         }
@@ -2075,10 +2079,10 @@ static void HudAction(int btn)
         break;
     }
     case HUD_DRY: {
-        // 在几档常用时长之间循环
-        static const float kDry[] = { 30.0f, 60.0f, 120.0f, 180.0f, 300.0f };
+        // 在几档常用时长之间循环（5 分钟 ~ 4 小时）
+        static const float kDry[] = { 300.0f, 900.0f, 1800.0f, 3600.0f, 7200.0f, 14400.0f };
         const int n = (int)(sizeof(kDry) / sizeof(kDry[0]));
-        int cur = 2;                     // 默认对应 120 秒
+        int cur = 2;                     // 默认对应 30 分钟
         for (int i = 0; i < n; ++i)
             if (fabsf(kDry[i] - g_drySeconds) < 1.0f) { cur = i; break; }
         g_drySeconds = kDry[(cur + 1) % n];
