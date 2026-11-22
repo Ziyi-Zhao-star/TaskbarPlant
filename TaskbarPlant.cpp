@@ -11,7 +11,7 @@
 //    2. 物理边界不再是 380x280 的小窗口，而是任务栏以上的整块工作区；默认地面是任务栏上沿，
 //       花盆掉到任意窗口的标题栏上时会被标题栏“接住”。
 //    3. 自写物理：重力、地面碰撞、弹跳、旋转、拖拽甩出、落地扬尘。
-//    4. 右键弹出自绘的像素风菜单：可切换 13 种植物、放置新花盆、移除花盆；
+//    4. 右键弹出自绘的像素风菜单：可切换 17 种植物、放置新花盆、移除花盆；
 //       每个花盆都是独立刚体，可以同时养很多盆。
 //    5. 定时器轮询前台窗口，若其覆盖整个显示器（全屏视频/游戏）则 SW_HIDE，
 //       结束后 SW_SHOWNA 恢复（不抢焦点）。
@@ -81,6 +81,22 @@ static const float    POT_SCALE_STEP = 0.1f;        // 每次调大/调小的步
 static const float    DRY_THRESHOLD = 0.40f;        // 水分低于它开始发蔫
 static const float    WATER_DURATION = 2.2f;        // 浇水动画时长（秒）
 
+// ---------------------------------------------------------------------------
+// 常年微风（v3.6.0 新增）—— 让植物在没有交互时也轻轻摇。
+// 这些参数是平台无关的纯数学，Linux 移植版照搬 WindForce() 与下面的
+// 弹簧参数即可，不依赖任何 Win32 / GDI+ 接口。
+// ---------------------------------------------------------------------------
+static const float    WIND_SWAY_PERIOD  = 1.0f / 0.7f;   // 主体摆动周期（秒）
+static const float    WIND_GUST_PERIOD  = 1.0f / 0.23f;  // 强弱起伏周期（秒，约 4.3s 一阵）
+// 两列正弦叠加出非周期的风吹感，返回值直接加在摆动弹簧的速度上（px 级力矩）
+static inline float WindForce(float t)
+{
+    float gust = 0.55f + 0.45f * sinf(t * 0.23f + 0.9f);              // 一阵强一阵弱
+    return gust * (7.5f * sinf(t * 0.7f)
+                 + 4.0f * sinf(t * 1.73f + 1.3f)
+                 + 2.5f * sinf(t * 3.1f + 0.7f));
+}
+
 static const wchar_t* kWndClass = L"TaskbarPlant_Window";
 static const wchar_t* kMenuClass = L"TaskbarPlant_Menu";
 
@@ -103,10 +119,16 @@ enum PlantType {
     PLANT_CLOVER,
     PLANT_CHILI,
     PLANT_DANDELION,
+    PLANT_DAISY,
+    PLANT_ALOE,
+    PLANT_MORNINGGLORY,
+    PLANT_CHERRY,
     PLANT_COUNT
 };
 
 // 右键菜单：先是植物列表，再是命令
+static const wchar_t* kVersionText = L"v3.8.2";   // 菜单底部的版本号（连点 7 次开调试模式）
+
 enum MenuCmd {
     MENU_CMD_WATER = PLANT_COUNT,   // 浇水
     MENU_CMD_EDIT,                  // 编辑模式
@@ -116,6 +138,7 @@ enum MenuCmd {
     MENU_CMD_REMOVE,                // 移除这个花盆
     MENU_CMD_EXPORT,                // 导出植物图片
     MENU_CMD_QUIT,                  // 退出程序
+    MENU_CMD_VERSION,               // 版本号（连点 7 次开调试模式）
     MENU_ITEM_COUNT
 };
 
@@ -123,8 +146,10 @@ static const wchar_t* kMenuItemText[MENU_ITEM_COUNT] = {
     L"仙人掌", L"向日葵", L"食人花", L"郁金香", L"蘑菇",
     L"小松树", L"多肉", L"竹子", L"玫瑰",
     L"薰衣草", L"三叶草", L"辣椒", L"蒲公英",
+    L"雏菊", L"芦荟", L"牵牛花", L"樱花",
     L"浇水", L"编辑模式", L"花盆调大", L"花盆调小",
-    L"放置新花盆", L"移除这个花盆", L"导出植物图片", L"退出程序"
+    L"放置新花盆", L"移除这个花盆", L"导出植物图片", L"退出程序",
+    kVersionText
 };
 static const int kMenuCount = MENU_ITEM_COUNT;
 static const int kMenuW = 246;                            // 植物区双栏 + 命令区单栏
@@ -162,6 +187,7 @@ struct Pot {
     float     moisture;   // 泥土水分 1=湿透 0=干透
     float     waterAnim;  // 浇水动画剩余时间（秒），0 表示没在浇水
     float     shedTimer;  // 枯叶掉落节流
+    float     windPh;     // 常年微风的相位偏移（每盆错开，避免多盆整齐划一地摇）
 };
 
 static HWND  g_hwnd = nullptr;
@@ -196,6 +222,35 @@ static float g_saveTimer = 0.0f;         // 自动保存节流
 struct WiltParticle { float x, y, vx, vy, life; };
 static std::vector<WiltParticle> g_wilt;
 
+// ---------------------------------------------------------------------------
+// 天气系统（v3.7 新增）：雨 / 雪 / 风雨加大 / 积水 / 积雪
+// 平台无关：只依赖 g_time / g_floorY / g_pots / 4px 像素助手函数，
+// Linux 移植版把这一段照搬即可（详见 README 的移植同步章节）。
+// ---------------------------------------------------------------------------
+enum WeatherKind { WEATHER_CLEAR = 0, WEATHER_RAIN, WEATHER_SNOW };
+
+struct RainDrop  { float x, y, vy; };                 // 竖直下落的雨线
+struct SnowFlake { float x, y, vy, ph, amp; };        // 横向摇摆着飘的雪花
+struct Splash    { float x, y, vx, vy, life; };       // 落水 / 砸盆溅起的水珠
+
+static const float PUDDLE_MAX = 6.0f;                 // 积水最大深度 px
+static const float SNOW_MAX   = 6.0f;                 // 积雪最大厚度 px
+static const float RAIN_SPEED_MIN = 900.0f;           // 雨滴下落速度 px/s
+static const float RAIN_SPEED_MAX = 1250.0f;
+
+static int   g_weather      = WEATHER_CLEAR;
+static float g_weatherTimer = 25.0f;    // 晴天时距下一次“掷骰子”的倒计时（秒）
+static float g_weatherLeft  = 0.0f;     // 当前降水的剩余时间（秒）
+static float g_storm        = 0.0f;     // 风雨增幅 0~1（降水时平滑升到 1）
+static float g_puddle       = 0.0f;     // 任务栏上沿的积水深度 px
+static float g_snowCover    = 0.0f;     // 地面与植物上的积雪厚度 px
+static std::vector<RainDrop>  g_rain;
+static std::vector<SnowFlake> g_flakes;
+static std::vector<Splash>    g_splash;
+
+static float g_precip = 0.0f;             // 降水强度 0~1（起雨 / 停雨平滑过渡）
+static int   g_lastWeather = WEATHER_CLEAR;  // 上一次的天气（用于切换时清空另一种粒子）
+
 // 编辑模式：此时改动只在内存里，点“保存”才写入 ini
 static bool  g_editMode = false;
 static float g_drySeconds = 1800.0f;     // 干枯时间（秒），默认 30 分钟，可在编辑模式里改
@@ -209,6 +264,18 @@ static const int HUD_BTN_H = 40;
 static const int HUD_GAP = 8;
 
 enum HudBtn { HUD_ADD = 0, HUD_DRY, HUD_SAVE, HUD_DONE, HUD_BTN_COUNT };
+
+// 隐藏调试模式：右键菜单底部的版本号连点 7 次开启，
+// 提供「干枯 / 下雨 / 下雪 / 关闭调试模式」。关闭后不留任何持久状态。
+enum DebugBtn { DBG_DRY = 0, DBG_RAIN, DBG_SNOW, DBG_OFF, DBG_BTN_COUNT };
+static bool  g_debugMode = false;
+static int   g_debugHot = -1;
+static int   g_versionClicks = 0;
+static float g_versionClickTimer = 0.0f;    // 两次点击间隔超过 3 秒就清零（静默计数，无提示）
+
+// 顶部提示条（如：保存配置时有花盆在标题栏上）
+static wchar_t g_toastText[128] = { 0 };
+static float   g_toastTimer = 0.0f;
 
 static float g_mouseX = 0.0f, g_mouseY = 0.0f;
 
@@ -253,19 +320,39 @@ static void FillPixelEllipse(Graphics& g, Brush* br, float cx, float cy, float r
     }
 }
 
-// 像素叶片：从 (x,y) 往 dir 方向斜着伸出的阶梯叶，逐格收窄
+// 像素叶片（v3.7 重绘）：基部饱满 -> 中段收窄 -> 末端收成 4px 尖，
+// 叶尖逐渐放平并微微下垂，比旧版“一刀切”的阶梯叶更有机
+// shade：叶底暗色描边（可选），vein：叶脉高光（可选）
 static void DrawPixelLeaf(Graphics& g, float x, float y, int dir,
-                          float len, float span, float halfW, Brush* br, Brush* vein)
+                          float len, float span, float halfW, Brush* br, Brush* vein,
+                          Brush* shade = nullptr)
 {
     int rows = (int)floorf(len / PIX + 0.5f);
-    if (rows < 1) rows = 1;
+    if (rows < 3) rows = 3;
+    float y0 = SnapPx(y);
     for (int i = 0; i < rows; ++i) {
-        float k  = (float)(i + 1) / (float)rows;
-        float cx = SnapPx(x + (float)dir * span * k);
-        float hw = SnapPx(halfW * (1.0f - k * 0.7f));
+        float k = (float)(i + 1) / (float)rows;
+
+        // 宽度：前 70% 缓慢收窄（饱满），后 30% 收成尖
+        float hw;
+        if (k < 0.7f) hw = halfW * (1.0f - k * 0.42f);
+        else          hw = halfW * (1.0f - 0.7f * 0.42f) * (1.0f - (k - 0.7f) / 0.3f);
+        hw = SnapPx(hw);
         if (hw < PIX * 0.5f) hw = PIX * 0.5f;
-        float yy = SnapPx(y) - (float)(i + 1) * PIX;
+
+        // 横向：前 70% 匀速斜伸，后 30% 越来越平（横向步距加大）
+        float fx;
+        if (k <= 0.7f) fx = k / 0.7f * 0.7f;
+        else           fx = 0.7f + (k - 0.7f) / 0.3f * 0.3f;
+        float cx = SnapPx(x + (float)dir * span * fx);
+
+        // 纵向：前 70% 每行上爬 4px，后 30% 每行只爬一半，叶尖放平下垂
+        float rise = (k <= 0.7f) ? (float)(i + 1) * PIX
+                                 : 0.7f * len + ((float)i + 1 - 0.7f * (float)rows) * PIX * 0.5f;
+        float yy = y0 - rise;
+
         FillRectF(g, br, cx - hw, yy, hw * 2.0f, PIX);
+        if (shade) FillRectF(g, shade, cx - hw, yy + PIX, hw * 2.0f, PIX * 0.5f); // 叶底阴影
         if (vein && i * 2 < rows)
             FillRectF(g, vein, cx - PIX * 0.5f, yy, PIX, PIX);
     }
@@ -346,15 +433,19 @@ static PointF DrawBentStem(Graphics& g, float baseX, float baseY, float height,
     return PointF(tipX, y0 - (float)rows * PIX);
 }
 
-// 叶子（像素版）
+// 叶子（像素版）：v3.6 起带微风颤动，v3.7 重绘形 + 叶底阴影
 static void DrawLeaf(Graphics& g, float soilY, float height, float p, float sway, int dir)
 {
     SolidBrush leaf(C(100, 178, 72));
     SolidBrush vein(C(64, 126, 48));
+    SolidBrush shade(C(56, 112, 44));
 
     float x = sway * 46.0f * powf(p, 1.9f);
     float y = soilY - height * p;
-    DrawPixelLeaf(g, x, y + PIX * 3.0f, dir, 20.0f, 24.0f, 8.0f, &leaf, &vein);
+    float flutter = sinf(g_time * 1.9f + height * 0.11f + (float)dir * 2.0f)
+                  * PIX * 2.0f * p;                 // 越靠叶尖颤幅越大
+    DrawPixelLeaf(g, x + flutter, y + PIX * 2.0f, dir, 26.0f, 30.0f, 9.0f,
+                  &leaf, &vein, &shade);
 }
 
 // 向日葵花盘：花瓣是 16x16 的像素块，花心是栅格化的像素椭圆
@@ -395,8 +486,8 @@ static void DrawSunflower(Graphics& g, float soilY, float sway, float t)
     const float h = 108.0f;
 
     PointF tip = DrawBentStem(g, 0.0f, soilY, h, sway, &stem, 7.0f);
-    DrawLeaf(g, soilY, h, 0.34f, sway, -1);
-    DrawLeaf(g, soilY, h, 0.58f, sway, +1);
+    DrawLeaf(g, soilY, h, 0.382f, sway, -1);    // 叶位取黄金分割点 1/φ² 与 1/φ
+    DrawLeaf(g, soilY, h, 0.618f, sway, +1);
     DrawSunflowerHead(g, tip.X, tip.Y - 10.0f, sway, t);
 }
 
@@ -720,10 +811,11 @@ static void DrawBamboo(Graphics& g, float soilY, float sway, float t)
     SolidBrush leafDark(C(84, 142, 56));
 
     struct Stalk { float x, h, ph; };
+    // 三根竹竿高度按黄金比例递减：158 / 98 / 61（φ 链）
     const Stalk stalks[3] = {
-        { -16.0f, 112.0f, 0.0f },
+        { -16.0f,  98.0f, 0.0f },
         {   0.0f, 158.0f, 1.2f },
-        {  20.0f,  94.0f, 2.4f }
+        {  20.0f,  61.0f, 2.4f }
     };
 
     GraphicsState st = g.Save();
@@ -766,9 +858,9 @@ static void DrawRose(Graphics& g, float soilY, float sway, float t)
     const float h = 124.0f;
     PointF tip = DrawBentStem(g, 0.0f, soilY, h, sway, &stem, 5.0f);
 
-    // 叶子与刺
-    DrawLeaf(g, soilY, h, 0.32f, sway, 1);
-    DrawLeaf(g, soilY, h, 0.55f, sway, -1);
+    // 叶子与刺（叶位取黄金分割点）
+    DrawLeaf(g, soilY, h, 0.382f, sway, 1);
+    DrawLeaf(g, soilY, h, 0.618f, sway, -1);
     FillRectF(g, &thorn, SnapPx(tip.X) - 4.0f, SnapPx(tip.Y) + 20.0f, 4.0f, 4.0f);
     FillRectF(g, &thorn, SnapPx(tip.X) + 4.0f, SnapPx(tip.Y) + 40.0f, 4.0f, 4.0f);
 
@@ -788,53 +880,56 @@ static void DrawRose(Graphics& g, float soilY, float sway, float t)
     g.Restore(st);
 }
 
-// 薰衣草：三根细茎，顶端各顶一串紫色小花
+// 薰衣草（v3.8.2 再调：整体收窄——穗粒基部只占 2 格、穗身 1 格，比旧版苗条一多半；
+// 四根花穗高低明显拉开（64 ~ 120px），左右倾斜互相抵消，视觉平衡、不挤在顶部）
 static void DrawLavender(Graphics& g, float soilY, float sway, float t)
 {
     SolidBrush stem(C(88, 146, 68));
-    SolidBrush leaf(C(104, 166, 84));
-    SolidBrush leafDark(C(72, 130, 58));
     SolidBrush budA(C(152, 106, 202));
     SolidBrush budB(C(116, 74, 170));
     SolidBrush budLight(C(198, 160, 236));
 
-    struct Spike { float x, h, ph; };
-    const Spike spikes[3] = {
-        { -14.0f,  96.0f, 0.0f },
-        {   2.0f, 124.0f, 1.1f },
-        {  16.0f,  82.0f, 2.2f }
+    struct Spike { float x, h, ph, lean; int grains; };
+    // 布局：最矮的一根在中间偏左（远离右穗），右穗独立在最右；
+    // 四穗穗尖横向间距 ≥ 11px，互不粘连
+    const Spike spikes[4] = {
+        { -18.0f,  96.0f, 0.0f, -4.0f, 6 },   // 左后方，偏高，左倾
+        {  -6.0f, 120.0f, 1.1f,  3.0f, 7 },   // 最高的一根，右倾
+        {   6.0f,  52.0f, 2.0f,  4.0f, 5 },   // 最矮的一根，前中（比上一版右移一格像素）
+        {  22.0f,  84.0f, 2.9f,  3.0f, 6 },   // 右边独立一根，右倾
     };
 
     GraphicsState st = g.Save();
     g.TranslateTransform(0.0f, SnapPx(soilY));
 
-    // 贴地两片细叶
-    DrawPixelLeaf(g, -2.0f,  0.0f, -1, 24.0f, 28.0f, 6.0f, &leaf, nullptr);
-    DrawPixelLeaf(g,  2.0f, -4.0f, +1, 20.0f, 26.0f, 6.0f, &leafDark, nullptr);
-
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         const Spike& s = spikes[i];
         int   rows = (int)floorf(s.h / PIX + 0.5f);
-        float bend = sway * 14.0f + sinf(t * 0.9f + s.ph) * 2.0f;
+        float bend = sway * 10.0f + sinf(t * 0.9f + s.ph) * 2.0f + s.lean;
 
-        // 茎：4px 宽，逐格往上，越靠上弯得越多
+        // 茎：4px 宽，越靠上越往 lean + bend 方向弯
         for (int r = 0; r < rows; ++r) {
             float k  = (float)r / (float)rows;
             float dx = SnapPx(s.x + bend * k * k);
             FillRectF(g, &stem, dx - PIX * 0.5f, -(float)(r + 1) * PIX, PIX, PIX);
         }
 
-        // 花穗：茎尖往上堆 5 格，奇偶行左右错开半格
+        // 花穗：从茎尖往上 grains 粒，基部 2 行 2 格宽、其余全部 1 格（苗条），
+        // 奇偶行左右错开半格；每根穗的粒数不同
         float tipX = SnapPx(s.x + bend);
         float tipY = -(float)rows * PIX;
-        for (int j = 0; j < 5; ++j) {
-            float  y    = tipY - (float)(j + 1) * PIX;
-            Brush* main = (j & 1) ? (Brush*)&budB : (Brush*)&budA;
-            float  off  = (j & 1) ? PIX * 0.5f : -PIX * 0.5f;
-            FillRectF(g, main,        tipX - PIX * 1.5f + off, y, PIX * 3.0f, PIX);
-            FillRectF(g, &budLight,   tipX - PIX * 1.5f + off, y, PIX, PIX);
+        for (int j = 0; j < s.grains; ++j) {
+            float y   = tipY - (float)j * PIX;
+            float w   = PIX * ((j < 2) ? 2.0f : 1.0f);
+            float off = (j & 1) ? PIX * 0.5f : -PIX * 0.5f;
+            float gx  = tipX + off;
+            bool  alt = ((j & 1) ^ (i & 1)) != 0;          // 每根穗的明暗节奏错开
+            Brush* main = alt ? (Brush*)&budB : (Brush*)&budA;
+            FillRectF(g, main,      gx - w * 0.5f, y, w, PIX);
+            FillRectF(g, &budLight, gx - w * 0.5f, y, PIX, PIX);
         }
-        FillRectF(g, &budB, tipX - PIX * 0.5f, tipY - 6.0f * PIX, PIX, PIX);
+        // 顶芽：单粒圆头收尾
+        FillRectF(g, &budB, tipX - PIX * 0.5f, tipY - (float)s.grains * PIX, PIX, PIX);
     }
 
     g.Restore(st);
@@ -975,6 +1070,186 @@ static void DrawDandelion(Graphics& g, float soilY, float sway, float t)
     g.Restore(st);
 }
 
+// 雏菊：细茎顶一朵小白花，黄色花心，花瓣一圈 8x8 像素块
+static void DrawDaisy(Graphics& g, float soilY, float sway, float t)
+{
+    SolidBrush stem(C(96, 158, 72));
+    SolidBrush petal(C(250, 250, 242));
+    SolidBrush petalShade(C(216, 220, 204));
+    SolidBrush core(C(244, 196, 58));
+    SolidBrush coreDark(C(206, 150, 34));
+
+    const float h = 98.0f;
+    PointF tip = DrawBentStem(g, 0.0f, soilY, h, sway, &stem, 6.0f);
+    DrawLeaf(g, soilY, h, 0.382f, sway, -1);    // 叶位取黄金分割点
+    DrawLeaf(g, soilY, h, 0.618f, sway, +1);
+
+    GraphicsState st = g.Save();
+    g.TranslateTransform(SnapPx(tip.X), SnapPx(tip.Y) - 8.0f);
+    g.RotateTransform(sway * 15.0f + sinf(t * 1.5f) * 3.0f);
+
+    // 花瓣：8 瓣交错两色，中心补一块白底盘
+    const int n = 8;
+    for (int i = 0; i < n; ++i) {
+        float a  = (float)i * (2.0f * PI_F) / (float)n;
+        float px = SnapPx(cosf(a) * 16.0f);
+        float py = SnapPx(sinf(a) * 16.0f);
+        Brush* br = (i & 1) ? (Brush*)&petalShade : (Brush*)&petal;
+        FillRectF(g, br, px - 4.0f, py - 4.0f, 8.0f, 8.0f);
+    }
+    FillPixelEllipse(g, &petal, 0.0f, 0.0f, 10.0f, 10.0f);
+    FillPixelEllipse(g, &core, 0.0f, 0.0f, 7.0f, 7.0f);
+    FillPixelEllipse(g, &coreDark, 2.0f, 2.0f, 3.5f, 3.5f);
+
+    g.Restore(st);
+}
+
+// 芦荟（v3.7 重绘）：后排 3 片暗叶 + 前排 3 片亮叶，
+// 叶片基部最宽、向上收窄、中段起按 k^1.6 曲线往外弯，尖端收成 4px，
+// 叶面带一条高光条纹，不再有生硬的锯齿
+static void DrawAloe(Graphics& g, float soilY, float sway, float t)
+{
+    SolidBrush back(C(62, 126, 92));        // 后排叶（背光）
+    SolidBrush backDark(C(46, 100, 74));
+    SolidBrush blade(C(96, 168, 118));      // 前排叶
+    SolidBrush bladeDark(C(62, 126, 92));
+    SolidBrush bladeLight(C(150, 208, 160));
+    SolidBrush stripe(C(198, 234, 198));    // 叶面高光条纹
+
+    struct Frond { float x, h, lean; };     // lean：叶尖横向偏移（往两侧弯）
+    const Frond backF[3] = {
+        { -20.0f, 78.0f, -18.0f },
+        {   0.0f, 96.0f,   0.0f },
+        {  20.0f, 74.0f,  20.0f },
+    };
+    const Frond frontF[3] = {
+        { -14.0f, 62.0f, -22.0f },
+        {   2.0f, 80.0f,   6.0f },
+        {  16.0f, 56.0f,  24.0f },
+    };
+
+    GraphicsState st = g.Save();
+    g.TranslateTransform(0.0f, SnapPx(soilY));
+    g.RotateTransform(sway * 4.0f + sinf(t * 0.8f) * 1.0f);
+
+    // 一片芦荟叶：先画后排（暗），再画前排（亮）压在上面
+    struct Pal { Brush* main; Brush* dark; Brush* light; bool stripeOn; };
+    const Pal pals[2] = {
+        { &back,  &backDark,  &backDark,  false },
+        { &blade, &bladeDark, &bladeLight, true  },
+    };
+    for (int layer = 0; layer < 2; ++layer) {
+        const Pal& pal = pals[layer];
+        const Frond* fs = (layer == 0) ? backF : frontF;
+        for (int i = 0; i < 3; ++i) {
+            const Frond& f = fs[i];
+            int rows = (int)floorf(f.h / PIX + 0.5f);
+            for (int r = 0; r < rows; ++r) {
+                float k  = (float)r / (float)rows;       // 0=根部 1=叶尖
+                float cx = SnapPx(f.x + f.lean * powf(k, 1.6f) + sway * 5.0f * k);
+                float hw = PIX * (1.5f - k);             // 基部 3 格宽 -> 尖端 1 格
+                if (hw < PIX * 0.5f) hw = PIX * 0.5f;
+                float y = -(float)(r + 1) * PIX;
+                FillRectF(g, pal.main,  cx - hw, y, hw * 2.0f, PIX);
+                FillRectF(g, pal.dark,  cx + hw - PIX * 0.5f, y, PIX * 0.5f, PIX);
+                FillRectF(g, pal.light, cx - hw, y, PIX * 0.5f, PIX);
+                if (pal.stripeOn && k > 0.2f && k < 0.92f)
+                    FillRectF(g, &stripe, cx - PIX * 0.5f, y, PIX, PIX);
+            }
+        }
+    }
+
+    g.Restore(st);
+}
+
+// 牵牛花：细茎顶着喇叭形花冠，喇叭口朝上，喉部白色带星纹
+static void DrawMorningGlory(Graphics& g, float soilY, float sway, float t)
+{
+    SolidBrush stem(C(84, 148, 66));
+    SolidBrush leafA(C(104, 174, 82));
+    SolidBrush leafB(C(74, 138, 60));
+    SolidBrush petal(C(108, 122, 214));
+    SolidBrush petalLight(C(150, 160, 240));
+    SolidBrush petalDark(C(76, 84, 172));
+    SolidBrush throat(C(246, 244, 230));
+    SolidBrush star(C(120, 100, 190));
+
+    const float h = 118.0f;
+    PointF tip = DrawBentStem(g, 0.0f, soilY, h, sway, &stem, 6.0f);
+
+    // 两片细长叶
+    GraphicsState ls = g.Save();
+    g.TranslateTransform(0.0f, SnapPx(soilY));
+    g.RotateTransform(sway * 8.0f);
+    DrawPixelLeaf(g, 0.0f,  0.0f, -1, 34.0f, 26.0f, 7.0f, &leafA, nullptr);
+    DrawPixelLeaf(g, 0.0f, -6.0f, +1, 28.0f, 24.0f, 6.0f, &leafB, nullptr);
+    g.Restore(ls);
+
+    // 花冠：绕茎尖轻轻摆动
+    GraphicsState st = g.Save();
+    g.TranslateTransform(SnapPx(tip.X), SnapPx(tip.Y) - 4.0f);
+    g.RotateTransform(sway * 12.0f + sinf(t * 1.3f) * 3.0f);
+
+    // 花萼
+    FillRectF(g, &petalDark, -4.0f, -8.0f, 8.0f, 8.0f);
+    // 漏斗管：从下往上逐行加宽
+    FillRectF(g, &petal,      -6.0f,  -16.0f, 12.0f, 8.0f);
+    FillRectF(g, &petalLight, -6.0f,  -16.0f, 4.0f,  8.0f);
+    FillRectF(g, &petal,     -12.0f,  -24.0f, 24.0f, 8.0f);
+    FillRectF(g, &petalLight, -12.0f, -24.0f, 4.0f,  8.0f);
+    FillRectF(g, &petal,     -18.0f,  -32.0f, 36.0f, 8.0f);
+    FillRectF(g, &petalDark,  14.0f,  -24.0f, 4.0f, 16.0f);   // 右侧背光
+    // 喇叭口：白色喉部 + 深色星纹（中间再点一撮白）
+    FillRectF(g, &throat,    -18.0f, -40.0f, 36.0f, 8.0f);
+    FillRectF(g, &star,       -6.0f, -40.0f, 12.0f, 8.0f);
+    FillRectF(g, &throat,     -2.0f, -40.0f, 4.0f,  8.0f);
+
+    g.Restore(st);
+}
+
+// 樱花：褐色短干 + 三团粉色树冠，树冠里点几朵小白花，旁边飘着一片花瓣
+static void DrawCherry(Graphics& g, float soilY, float sway, float t)
+{
+    SolidBrush trunk(C(122, 88, 66));
+    SolidBrush trunkDark(C(94, 64, 46));
+    SolidBrush blobA(C(244, 178, 196));
+    SolidBrush blobB(C(224, 142, 168));
+    SolidBrush blobC(C(252, 208, 220));
+    SolidBrush flower(C(250, 236, 244));
+    SolidBrush petalFly(C(248, 184, 202));
+
+    const float h = 62.0f;      // 树干高
+
+    GraphicsState st = g.Save();
+    g.TranslateTransform(0.0f, SnapPx(soilY));
+    g.RotateTransform(sway * 4.0f + sinf(t * 0.9f) * 1.4f);
+
+    // 树干 + 一根小枝
+    FillRectF(g, &trunk,     -6.0f, -h, 12.0f, h);
+    FillRectF(g, &trunkDark,  2.0f, -h,  4.0f, h);
+    FillRectF(g, &trunk,      6.0f, -h + 6.0f, 22.0f, 4.0f);
+
+    // 三团树冠：像素椭圆拼贴；侧团半径 = 主团 × 1/φ，左右对称受风摆动
+    FillPixelEllipse(g, &blobB, -26.0f + sway * 6.0f, -h - 8.0f,  16.0f, 12.0f);
+    FillPixelEllipse(g, &blobB,  26.0f + sway * 8.0f, -h - 6.0f,  16.0f, 12.0f);
+    FillPixelEllipse(g, &blobA,   0.0f + sway * 10.0f, -h - 20.0f, 26.0f, 18.0f);
+    FillPixelEllipse(g, &blobC,  -8.0f + sway * 10.0f, -h - 26.0f, 12.0f, 8.0f);
+    FillPixelEllipse(g, &blobC,  14.0f + sway * 8.0f,  -h - 12.0f, 8.0f,  6.0f);
+
+    // 几朵小白花
+    FillRectF(g, &flower, -14.0f + sway * 8.0f,  -h - 22.0f, 4.0f, 4.0f);
+    FillRectF(g, &flower,   8.0f + sway * 10.0f, -h - 30.0f, 4.0f, 4.0f);
+    FillRectF(g, &flower,  20.0f + sway * 8.0f,  -h - 14.0f, 4.0f, 4.0f);
+
+    g.Restore(st);
+
+    // 飘落的花瓣：从树冠右侧缓缓下坠，落到底再回到树冠循环
+    float pa = fmodf(t * 0.5f, 1.0f);
+    float px = 30.0f + sinf(t * 0.8f) * 10.0f + pa * 14.0f;
+    float py = -h - 18.0f + pa * 46.0f;
+    FillRectF(g, &petalFly, SnapPx(px), SnapPx(py), PIX, PIX);
+}
+
 static float PlantHeight(PlantType t)
 {
     switch (t) {
@@ -991,6 +1266,10 @@ static float PlantHeight(PlantType t)
     case PLANT_CLOVER:    return 88.0f;
     case PLANT_CHILI:     return 128.0f;
     case PLANT_DANDELION: return 148.0f;
+    case PLANT_DAISY:         return 132.0f;
+    case PLANT_ALOE:          return 104.0f;
+    case PLANT_MORNINGGLORY:  return 168.0f;
+    case PLANT_CHERRY:        return 132.0f;
     default:              return 110.0f;
     }
 }
@@ -1034,10 +1313,251 @@ static void DrawPlantLocal(Graphics& g, float soilY, PlantType t, float sway, bo
     case PLANT_DANDELION:
         DrawDandelion(g, soilY, sway, g_time);
         break;
+    case PLANT_DAISY:
+        DrawDaisy(g, soilY, sway, g_time);
+        break;
+    case PLANT_ALOE:
+        DrawAloe(g, soilY, sway, g_time);
+        break;
+    case PLANT_MORNINGGLORY:
+        DrawMorningGlory(g, soilY, sway, g_time);
+        break;
+    case PLANT_CHERRY:
+        DrawCherry(g, soilY, sway, g_time);
+        break;
     case PLANT_SUNFLOWER:
     default:
         DrawSunflower(g, soilY, sway, g_time);
         break;
+    }
+}
+
+// =============================================================================
+//  一·五、天气系统（v3.7）：降水区域 / 雨 / 雪 / 积水 / 积雪
+// =============================================================================
+
+// 天气区域（v3.8.1）：按 x 把花盆聚成若干簇——相邻两盆之间的空隙超过
+// WEATHER_ZONE_GAP 时就分成两个区域，各自下各自的雨 / 雪，
+// 不再让降水落在两盆之间的空地上。每簇的包围盒：最左、最右、最高点再往上抬 60px。
+struct WeatherZone { float l, r, top; };
+static const float WEATHER_ZONE_GAP = 240.0f;    // 簇与簇之间允许的最大空隙 px
+
+static std::vector<WeatherZone> g_zones;
+
+static void RebuildWeatherZones()
+{
+    g_zones.clear();
+    if (g_pots.empty() || g_winW <= 0) {
+        WeatherZone z = { 0.0f, (float)g_winW, 60.0f };
+        g_zones.push_back(z);
+        return;
+    }
+
+    // 按 x 排序（盆数很少，插入排序足够）
+    std::vector<size_t> order(g_pots.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    for (size_t i = 1; i < order.size(); ++i)
+        for (size_t j = i; j > 0 && g_pots[order[j]].body.x < g_pots[order[j - 1]].body.x; --j) {
+            size_t t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
+        }
+
+    float cl = 1e9f, cr = -1e9f, ctop = 1e9f;
+    for (size_t i = 0; i < order.size(); ++i) {
+        const Pot& p = g_pots[order[i]];
+        const float halfW = (POT_W * 0.5f + 44.0f) * p.scale;
+        const float pTop  = p.body.y - POT_H * 0.5f * p.scale
+                          - (PlantHeight(p.plant) + 44.0f) * p.scale;
+
+        // 与当前簇右边缘的空隙超过阈值：先收拢当前簇，再开新簇
+        if (cl <= cr && p.body.x - halfW - cr > WEATHER_ZONE_GAP) {
+            WeatherZone z = { Clampf(cl, 0.0f, (float)g_winW),
+                              Clampf(cr, 0.0f, (float)g_winW),
+                              Clampf(ctop - 60.0f, 20.0f, g_floorY - 80.0f) };
+            g_zones.push_back(z);
+            cl = 1e9f; cr = -1e9f; ctop = 1e9f;
+        }
+        if (p.body.x - halfW < cl) cl = p.body.x - halfW;
+        if (p.body.x + halfW > cr) cr = p.body.x + halfW;
+        if (pTop < ctop) ctop = pTop;
+    }
+    if (cl <= cr) {
+        WeatherZone z = { Clampf(cl, 0.0f, (float)g_winW),
+                          Clampf(cr, 0.0f, (float)g_winW),
+                          Clampf(ctop - 60.0f, 20.0f, g_floorY - 80.0f) };
+        g_zones.push_back(z);
+    }
+}
+
+// 水珠：花盆砸进积水 / 雨滴落地时溅起
+static void SpawnSplash(float x, float y, int count)
+{
+    if (g_splash.size() > 120) return;
+    for (int i = 0; i < count; ++i) {
+        Splash s;
+        s.x = x + (float)((rand() % 61) - 30);
+        s.y = y - (float)(rand() % 3);
+        s.vx = (float)((rand() % 220) - 110);
+        s.vy = -(float)(150 + rand() % 160);
+        s.life = 0.35f + (float)(rand() % 20) / 100.0f;
+        g_splash.push_back(s);
+    }
+}
+
+static void UpdateWeather(float dt)
+{
+    // ---- 天气调度：晴天每隔一阵掷一次骰子，中签就下一场雨或雪 ----
+    if (g_weather == WEATHER_CLEAR) {
+        g_weatherTimer -= dt;
+        if (g_weatherTimer <= 0.0f) {
+            g_weatherTimer = 20.0f;
+            int roll = rand() % 100;
+            if (roll < 35) {                       // 35% 下雨
+                g_weather = WEATHER_RAIN;
+                g_weatherLeft = 18.0f + (float)(rand() % 25);
+            } else if (roll < 52) {                // 17% 下雪
+                g_weather = WEATHER_SNOW;
+                g_weatherLeft = 25.0f + (float)(rand() % 30);
+            }
+        }
+    } else {
+        g_weatherLeft -= dt;
+        if (g_weatherLeft <= 0.0f) {
+            g_weather = WEATHER_CLEAR;
+            g_weatherTimer = 45.0f + (float)(rand() % 90);
+        }
+    }
+
+    // 风力增幅平滑起落：下雨下雪时风变大
+    float target = (g_weather != WEATHER_CLEAR) ? 1.0f : 0.0f;
+    g_storm += (target - g_storm) * Clampf(dt * 0.8f, 0.0f, 1.0f);
+    // 降水强度也做平滑过渡（v3.8）：起雨/停雨时粒子密度、云的透明度都跟着渐变
+    g_precip += (target - g_precip) * Clampf(dt * 0.6f, 0.0f, 1.0f);
+
+    // 天气切换时清掉另一种降水粒子，避免雨滴和雪花同屏重叠（v3.8.2）
+    if (g_weather != g_lastWeather) {
+        if (g_weather == WEATHER_SNOW)      g_rain.clear();
+        else if (g_weather == WEATHER_RAIN) g_flakes.clear();
+        g_lastWeather = g_weather;
+    }
+
+    RebuildWeatherZones();
+
+    // ---- 降水粒子生成：每个天气区域各自铺密度，密度随 g_precip 渐变（雨量已调小）----
+    for (size_t zi = 0; zi < g_zones.size(); ++zi) {
+        const WeatherZone& z = g_zones[zi];
+        const float zw = z.r - z.l;
+        if (zw < 20.0f) continue;
+
+        if (g_weather == WEATHER_RAIN && g_rain.size() < 70) {
+            int n = (int)(zw / 55.0f) + 1;
+            if (n > 6) n = 6;
+            n = (int)(n * g_precip + 0.5f);          // 起雨/停雨时密度平滑起落
+            for (int i = 0; i < n; ++i) {
+                RainDrop d;
+                d.x  = z.l + (float)(rand() % 1000) * 0.001f * zw;
+                d.y  = z.top - (float)(rand() % 60);
+                d.vy = RAIN_SPEED_MIN + (float)(rand() % 1000) * 0.001f
+                     * (RAIN_SPEED_MAX - RAIN_SPEED_MIN);
+                g_rain.push_back(d);
+            }
+        }
+        if (g_weather == WEATHER_SNOW && g_flakes.size() < 150) {
+            int n = (int)(zw / 30.0f) + 1;
+            if (n > 16) n = 16;
+            n = (int)(n * g_precip + 0.5f);          // 降雪密度同样平滑起落
+            for (int i = 0; i < n; ++i) {
+                SnowFlake f;
+                f.x   = z.l + (float)(rand() % 1000) * 0.001f * zw;
+                f.y   = z.top - (float)(rand() % 60);
+                f.vy  = 55.0f + (float)(rand() % 80);
+                f.ph  = (float)(rand() % 628) * 0.01f;
+                f.amp = 10.0f + (float)(rand() % 16);
+                g_flakes.push_back(f);
+            }
+        }
+    }
+
+    // ---- 雨滴：落到植物上补水，落到地面归入积水并溅水花 ----
+    for (size_t i = 0; i < g_rain.size();) {
+        RainDrop& d = g_rain[i];
+        d.y += d.vy * dt;
+        bool hit = false;
+        // 先查是否碰到某个花盆 / 植物顶（v3.8：只在真正接触的一瞬溅起，
+        // 不再把整个轮廓上方的雨都“吸掉”，雨会从植物两侧自然落下）
+        for (size_t pi = 0; pi < g_pots.size(); ++pi) {
+            Pot& p = g_pots[pi];
+            const float halfW = 30.0f * p.scale;
+            if (d.x < p.body.x - halfW || d.x > p.body.x + halfW) continue;
+            float topY = p.body.y - POT_H * 0.5f * p.scale
+                       - (PlantHeight(p.plant) + 4.0f) * p.scale;
+            if (d.y >= topY) {
+                if (!g_editMode)
+                    p.moisture = Clampf(p.moisture + 0.012f, 0.0f, 1.0f);   // 下雨补水
+                SpawnSplash(d.x, d.y, 2);                                   // 碰到植物溅起
+                hit = true;
+                break;
+            }
+        }
+        // 落到地面（积雪上也算）
+        if (!hit && d.y >= g_floorY - g_snowCover - 2.0f) {
+            if (g_puddle < PUDDLE_MAX) g_puddle += 0.05f;
+            if ((rand() % 3) == 0)
+                SpawnSplash(d.x, g_floorY - g_puddle - g_snowCover, 2);
+            hit = true;
+        }
+        if (hit || d.y > g_floorY + 20.0f) {
+            g_rain[i] = g_rain.back();
+            g_rain.pop_back();
+        } else {
+            ++i;
+        }
+    }
+
+    // ---- 雪花：慢慢飘，落到地面增加积雪 ----
+    for (size_t i = 0; i < g_flakes.size();) {
+        SnowFlake& f = g_flakes[i];
+        f.y += f.vy * dt;
+        f.x += sinf(g_time * 0.9f + f.ph) * f.amp * (0.6f + g_storm * 1.6f) * dt;
+        if (f.y >= g_floorY - g_snowCover) {
+            if (g_snowCover < SNOW_MAX) g_snowCover += 0.05f;
+            g_flakes[i] = g_flakes.back();
+            g_flakes.pop_back();
+        } else {
+            ++i;
+        }
+    }
+
+    // ---- 水珠：轻重力，落到地面或到时间就消失 ----
+    for (size_t i = 0; i < g_splash.size();) {
+        Splash& s = g_splash[i];
+        s.vy += 1500.0f * dt;
+        s.x += s.vx * dt;
+        s.y += s.vy * dt;
+        s.life -= dt;
+        if (s.life <= 0.0f || s.y > g_floorY - g_snowCover) {
+            g_splash[i] = g_splash.back();
+            g_splash.pop_back();
+        } else {
+            ++i;
+        }
+    }
+
+    // ---- 积水 / 积雪演化（v3.8：雪要化成水再消失，融雪汇入积水）----
+    if (g_weather == WEATHER_RAIN) {
+        g_puddle = Clampf(g_puddle + dt * 0.30f, 0.0f, PUDDLE_MAX);
+        float melt = dt * 0.55f;                                          // 雨化雪
+        if (melt > g_snowCover) melt = g_snowCover;
+        g_snowCover = Clampf(g_snowCover - melt, 0.0f, SNOW_MAX);
+        g_puddle    = Clampf(g_puddle + melt * 0.8f, 0.0f, PUDDLE_MAX);
+    } else if (g_weather == WEATHER_SNOW) {
+        g_snowCover = Clampf(g_snowCover + dt * 0.22f, 0.0f, SNOW_MAX);
+        g_puddle    = Clampf(g_puddle - dt * 0.12f, 0.0f, PUDDLE_MAX);
+    } else {
+        float melt = dt * 0.08f;                                          // 慢慢融化成水
+        if (melt > g_snowCover) melt = g_snowCover;
+        g_snowCover = Clampf(g_snowCover - melt, 0.0f, SNOW_MAX);
+        g_puddle    = Clampf(g_puddle + melt * 0.8f, 0.0f, PUDDLE_MAX);
+        g_puddle    = Clampf(g_puddle - dt * 0.20f, 0.0f, PUDDLE_MAX);    // 同时慢慢蒸发
     }
 }
 
@@ -1224,7 +1744,7 @@ static void UpdatePot(Pot& p, float dt)
         p.waterAnim -= dt;
         if (p.waterAnim < 0.0f) p.waterAnim = 0.0f;
         p.moisture = Clampf(p.moisture + dt / 1.2f, 0.0f, 1.0f);
-        p.swayVel += sinf(g_time * 20.0f) * 0.04f;   // 被水浇得直晃
+        p.swayVel += sinf(g_time * 11.0f) * 0.06f;   // 被水浇得轻轻晃（低频，不抖）
     } else if (!g_editMode) {
         p.moisture = Clampf(p.moisture - dt / g_drySeconds, 0.0f, 1.0f);
     }
@@ -1293,6 +1813,9 @@ static void UpdatePot(Pot& p, float dt)
         if (b.vy > 0.0f) {
             if (b.vy > 260.0f) SpawnDust(b.x, surface, 10);    // 落地扬尘
             float impact = b.vy;
+            // 砸进积水里会溅起水花（v3.7）
+            if (g_puddle > 1.5f && surface >= g_floorY - 1.0f && impact > 200.0f)
+                SpawnSplash(b.x, surface - g_puddle, 9);
             b.vy = -b.vy * RESTITUTION;                        // 回弹
             if (fabsf(b.vy) < 55.0f) b.vy = 0.0f;              // 能量太小就停下
             b.vx *= 0.90f;
@@ -1327,16 +1850,21 @@ static void UpdatePot(Pot& p, float dt)
     b.vx = Clampf(b.vx, -3200.0f, 3200.0f);
     b.vy = Clampf(b.vy, -3200.0f, 3200.0f);
 
-    // 植物摆动：阻尼弹簧
-    const float stiffness = 110.0f;
-    const float damping = 6.5f;
+    // 植物摆动：阻尼弹簧（v3.6 调软：更慢、更柔）
+    const float stiffness = 72.0f;               // 原 110：弯得少了，回弹慢了
+    const float damping = 4.6f;                  // 原 6.5：欠阻尼更明显，像有韧性
     p.swayVel += (-stiffness * p.sway - damping * p.swayVel) * dt;
+    // 常年微风：静止时也轻轻摇；下雨下雪时风力加大（v3.7）
+    p.swayVel += WindForce(g_time + p.windPh) * (1.0f + g_storm * 2.2f) * dt;
     p.sway += p.swayVel * dt;
-    p.sway = Clampf(p.sway, -1.3f, 1.3f);
+    const float swayLimit = 1.3f + g_storm * 0.5f;    // 大风天允许摆得更多
+    p.sway = Clampf(p.sway, -swayLimit, swayLimit);
 }
 
 static void UpdatePhysics(float dt)
 {
+    UpdateWeather(dt);          // 天气（降水粒子 / 积水 / 积雪 / 风力增幅）
+
     for (size_t i = 0; i < g_pots.size(); ++i)
         UpdatePot(g_pots[i], dt);
 
@@ -1387,14 +1915,366 @@ static void UpdatePhysics(float dt)
 //  三、渲染（GDI+ -> 32bpp DIB -> UpdateLayeredWindow）
 // =============================================================================
 
+// 天气的地面层（v3.7）：任务栏上沿的积雪（白色厚毯，顶面起伏）与积水（半透明水面）
+// v3.8.1：每个天气区域各自一段，互不相邻的簇之间不留水雪
+static void DrawWeatherFloor(Graphics& g)
+{
+    RebuildWeatherZones();
+    for (size_t zi = 0; zi < g_zones.size(); ++zi) {
+        const WeatherZone& z = g_zones[zi];
+        if (z.r <= z.l) continue;
+
+        // 积雪
+        if (g_snowCover > 0.5f) {
+            SolidBrush snow(C(242, 246, 250));
+            SolidBrush snowShade(C(204, 216, 230));
+            float y = g_floorY - g_snowCover;
+            FillRectF(g, &snow, z.l, y, z.r - z.l, g_snowCover);
+            // 顶面隔格起伏 + 底部压暗，像自然的雪堆
+            for (float x = SnapPx(z.l); x < z.r; x += PIX) {
+                int cx = (int)(x / PIX);
+                if (cx & 1)
+                    FillRectF(g, &snow, x, y - PIX * 0.5f, PIX, PIX * 0.5f);
+                if ((cx & 3) == 0)
+                    FillRectF(g, &snowShade, x, g_floorY - PIX * 0.5f, PIX, PIX * 0.5f);
+            }
+        }
+
+        // 积水：半透明水面（水面最高时也没过雪的下沿），最上面一条高光
+        if (g_puddle > 0.5f) {
+            SolidBrush water(C(64, 138, 198, 150));
+            SolidBrush waterHi(C(188, 226, 250, 180));
+            float y = g_floorY - g_puddle - g_snowCover * 0.5f;
+            FillRectF(g, &water, z.l, y, z.r - z.l, g_puddle);
+            FillRectF(g, &waterHi, z.l, y, z.r - z.l, PIX * 0.5f);
+        }
+    }
+}
+
+// 每种植物"能积雪的位置"（v3.8.2）：花盆局部坐标里真实冠层的顶点集合。
+// 雪只落在这些位置上，不再浮在无形的轮廓框上。
+// 新增植物时在这里补几行即可（x 中心 / y 高度 / 半宽，均为局部坐标）。
+struct SnowSpot { float x, y, hw; };
+static int PlantSnowSpots(PlantType t, SnowSpot* spots, int maxSpots)
+{
+    const float soilY = -POT_H * 0.5f + 3.0f;    // 土面（与 DrawPlantLocal 一致）
+    int n = 0;
+    #define ADD_SPOT(px, py, phw) if (n < maxSpots) { spots[n].x = (px); spots[n].y = (py); spots[n].hw = (phw); ++n; }
+    switch (t) {
+    case PLANT_CACTUS:
+        ADD_SPOT(  0.0f, soilY - 100.0f, 10.0f)      // 主干顶
+        ADD_SPOT(-22.0f, soilY -  94.0f,  5.0f)      // 左臂顶
+        ADD_SPOT( 22.0f, soilY -  78.0f,  5.0f)      // 右臂顶
+        break;
+    case PLANT_SUNFLOWER:
+        ADD_SPOT(0.0f, soilY - 140.0f, 14.0f)        // 花盘顶
+        break;
+    case PLANT_FLYTRAP:
+        ADD_SPOT(0.0f, soilY - 116.0f, 13.0f)        // 颚顶
+        break;
+    case PLANT_TULIP:
+        ADD_SPOT(0.0f, soilY - 122.0f, 13.0f)        // 花苞顶
+        break;
+    case PLANT_MUSHROOM:
+        ADD_SPOT(0.0f, soilY -  76.0f, 12.0f)        // 菌盖顶
+        break;
+    case PLANT_PINE:
+        ADD_SPOT(0.0f, soilY -  72.0f, 20.0f)        // 三层树冠的"肩"
+        ADD_SPOT(0.0f, soilY - 102.0f, 15.0f)
+        ADD_SPOT(0.0f, soilY - 130.0f, 11.0f)
+        break;
+    case PLANT_SUCCULENT:
+        ADD_SPOT(0.0f, soilY -  66.0f, 28.0f)        // 莲座顶
+        break;
+    case PLANT_BAMBOO:
+        ADD_SPOT(  0.0f, soilY - 158.0f, 3.0f)       // 三根竹竿顶
+        ADD_SPOT(-16.0f, soilY -  98.0f, 3.0f)
+        ADD_SPOT( 20.0f, soilY -  61.0f, 3.0f)
+        break;
+    case PLANT_ROSE:
+        ADD_SPOT(0.0f, soilY - 156.0f, 11.0f)        // 花苞顶
+        break;
+    case PLANT_LAVENDER:
+        ADD_SPOT(-22.0f, soilY - 124.0f, 3.0f)       // 四根花穗顶（窄穗版）
+        ADD_SPOT( -3.0f, soilY - 152.0f, 3.0f)
+        ADD_SPOT( 10.0f, soilY -  76.0f, 3.0f)
+        ADD_SPOT( 25.0f, soilY - 112.0f, 3.0f)
+        break;
+    case PLANT_CLOVER:
+        ADD_SPOT(-16.0f, soilY - 62.0f, 9.0f)        // 三片心形叶顶
+        ADD_SPOT(  0.0f, soilY - 70.0f, 9.0f)
+        ADD_SPOT( 16.0f, soilY - 62.0f, 9.0f)
+        break;
+    case PLANT_CHILI:
+        ADD_SPOT(0.0f, soilY - 90.0f, 3.0f)          // 茎顶
+        break;
+    case PLANT_DANDELION:
+        ADD_SPOT(0.0f, soilY - 136.0f, 16.0f)        // 绒球顶
+        break;
+    case PLANT_DAISY:
+        ADD_SPOT(0.0f, soilY - 124.0f, 14.0f)        // 花头顶
+        break;
+    case PLANT_ALOE:
+        ADD_SPOT(  0.0f, soilY - 96.0f, 5.0f)        // 中间最高叶尖
+        ADD_SPOT(-38.0f, soilY - 64.0f, 4.0f)        // 左侧叶尖
+        ADD_SPOT(  8.0f, soilY - 80.0f, 4.0f)        // 前排叶尖
+        ADD_SPOT( 40.0f, soilY - 58.0f, 4.0f)        // 右侧叶尖
+        break;
+    case PLANT_MORNINGGLORY:
+        ADD_SPOT(0.0f, soilY - 162.0f, 14.0f)        // 喇叭口顶
+        break;
+    case PLANT_CHERRY:
+        ADD_SPOT(   0.0f, soilY - 98.0f, 20.0f)      // 主树冠顶
+        ADD_SPOT( -26.0f, soilY - 82.0f, 11.0f)      // 左侧树冠
+        ADD_SPOT(  26.0f, soilY - 82.0f, 11.0f)      // 右侧树冠
+        break;
+    default:
+        ADD_SPOT(0.0f, soilY - PlantHeight(t) + 6.0f, 10.0f)
+        break;
+    }
+    #undef ADD_SPOT
+    return n;
+}
+
+// 植物冠层上的积雪（v3.8.2 重做）：只在 PlantSnowSpots 给出的真实冠层顶上
+// 铺交错白格，雪厚时再叠一行；盆沿也积一条。画在花盆局部坐标系里。
+static void DrawSnowCapLocal(Graphics& g, const Pot& p)
+{
+    if (g_snowCover < 0.8f) return;
+    SolidBrush snow(C(246, 250, 254));
+    SolidBrush shade(C(204, 216, 230));
+    const float lv = Clampf(g_snowCover / SNOW_MAX, 0.0f, 1.0f);
+
+    SnowSpot spots[6];
+    int n = PlantSnowSpots(p.plant, spots, 6);
+    for (int i = 0; i < n; ++i) {
+        const SnowSpot& s = spots[i];
+        float y = SnapPx(s.y);
+        int cells = (int)(s.hw / PIX) + 1;
+        // 贴着冠层顶的一行（隔格留缝，露出下面的植物）
+        for (int c = -cells; c <= cells; ++c) {
+            if (((c + i) & 1) != 0) continue;
+            Brush* br = ((c & 3) == 0) ? (Brush*)&shade : (Brush*)&snow;
+            FillRectF(g, br, SnapPx(s.x + (float)c * PIX), y - PIX, PIX, PIX);
+        }
+        // 雪厚时在冠层顶上方再叠一行错缝的
+        if (lv > 0.45f) {
+            for (int c = -cells + 1; c <= cells - 1; ++c) {
+                if (((c + i) & 1) == 0) continue;
+                FillRectF(g, &snow, SnapPx(s.x + (float)c * PIX), y - PIX * 2.0f, PIX, PIX);
+            }
+        }
+    }
+
+    // 盆沿上的那条雪
+    float rimDepth = PIX * lv;
+    FillRectF(g, &snow, -POT_W * 0.5f, -POT_H * 0.5f - rimDepth, POT_W, rimDepth);
+}
+
+// 天气时的云（v3.8.2 定稿）：**一整条云盖住整个降水区域的落雨面**——
+// 云底正好压在雨滴/雪花生成的位置（z.top），像整片天空都在下雨/下雪；
+// 云体是横跨全区域的连续横带，顶部凸包高低起伏（确定性正弦 + 缓慢漂移，无状态），
+// 底部一条阴影压出厚度；灰蓝云体 + 受光高光，深浅壁纸上都有轮廓
+static void DrawClouds(Graphics& g)
+{
+    if (g_precip < 0.02f) return;
+    const int alpha = (int)(Clampf(g_precip, 0.0f, 1.0f) * 185.0f);
+    SolidBrush cloud(C(210, 220, 238, alpha));       // 灰蓝云体
+    SolidBrush cloudLight(C(248, 250, 254, alpha));  // 顶部受光
+    SolidBrush cloudShade(C(168, 180, 202, alpha));  // 底部阴影
+
+    RebuildWeatherZones();
+    for (size_t zi = 0; zi < g_zones.size(); ++zi) {
+        const WeatherZone& z = g_zones[zi];
+        const float zw = z.r - z.l;
+        if (zw < 60.0f) continue;
+
+        const float base = z.top;                    // 云底 = 降水粒子的起点
+        // 连续的云体横带：底边与雨/雪的起点齐平
+        FillRectF(g, &cloud, z.l, base - 12.0f, zw, 12.0f);
+        // 顶部凸包：沿区域宽度排布，高低按确定性正弦起伏，整体缓慢漂移
+        const int bumps = (int)(zw / 46.0f) + 1;
+        for (int i = 0; i <= bumps; ++i) {
+            float bx = z.l + zw * (float)i / (float)bumps
+                     + sinf(g_time * 0.10f + (float)i * 1.7f + (float)zi) * 6.0f;
+            float r  = 20.0f + 8.0f * sinf((float)i * 2.4f + (float)zi * 1.3f);
+            FillPixelEllipse(g, &cloud,      bx, base - 12.0f, r, r * 0.55f);
+            FillPixelEllipse(g, &cloudLight, bx, base - 16.0f, r * 0.55f, r * 0.30f);
+        }
+        // 底部阴影条：压出云的厚度
+        FillRectF(g, &cloudShade, z.l, base - PIX, zw, PIX);
+    }
+}
+
+// ---- 顶部提示条（v3.8）：保存配置时若有花盆在标题栏上则弹出提示 ----
+static const int TOAST_W = 470;
+static const int TOAST_H = 44;
+
+static int ToastTop()
+{
+    int y = 20;
+    if (g_editMode)  y += g_hudH + 8;
+    if (g_debugMode) y += HUD_BTN_H + HUD_PAD * 2 + 8;
+    return y;
+}
+
+static void ShowToast(const wchar_t* text, float dur = 3.0f)
+{
+    wcsncpy(g_toastText, text, 127);
+    g_toastText[127] = 0;
+    g_toastTimer = dur;
+    g_fullRedraw = true;
+}
+
+static void DrawToast(Graphics& g)
+{
+    if (g_toastTimer <= 0.0f) return;
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+
+    const float x = (float)((g_winW - TOAST_W) / 2);
+    const float y = (float)ToastTop();
+    SolidBrush panel(C(26, 20, 16, 235));
+    FillRectF(g, &panel, x, y, (float)TOAST_W, (float)TOAST_H);
+    SolidBrush edge(C(196, 148, 92, 240));
+    FillRectF(g, &edge, x, y, (float)TOAST_W, 2.0f);
+    FillRectF(g, &edge, x, y + TOAST_H - 2, (float)TOAST_W, 2.0f);
+    FillRectF(g, &edge, x, y, 2.0f, (float)TOAST_H);
+    FillRectF(g, &edge, x + TOAST_W - 2, y, 2.0f, (float)TOAST_H);
+
+    static Gdiplus::Font* font = nullptr;
+    static Gdiplus::StringFormat* fmt = nullptr;
+    if (!font) font = new Gdiplus::Font(L"Microsoft YaHei", 14.0f,
+                                        Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+    if (!fmt) {
+        fmt = new Gdiplus::StringFormat();
+        fmt->SetAlignment(Gdiplus::StringAlignmentCenter);
+        fmt->SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    }
+    SolidBrush txt(C(246, 240, 230));
+    RectF layout(x, y + 6.0f, (float)TOAST_W, (float)TOAST_H - 12.0f);
+    g.DrawString(g_toastText, -1, font, layout, fmt, &txt);
+}
+
+// ---- 调试模式工具条（v3.8）：干枯 / 下雨 / 下雪 / 关闭调试模式 ----
+static int g_dbgX = 0, g_dbgY = 0, g_dbgW = 0, g_dbgH = 0;
+
+static void DebugLayout()
+{
+    g_dbgW = HUD_PAD * 2 + HUD_BTN_W * DBG_BTN_COUNT + HUD_GAP * (DBG_BTN_COUNT - 1);
+    g_dbgH = HUD_BTN_H + HUD_PAD * 2;
+    g_dbgX = (g_winW - g_dbgW) / 2;
+    g_dbgY = 20;
+    if (g_editMode) g_dbgY = 20 + g_hudH + 8;    // 编辑模式工具条下面
+}
+
+static void DebugButtonRect(int i, float& bx, float& by)
+{
+    bx = (float)(g_dbgX + HUD_PAD + i * (HUD_BTN_W + HUD_GAP));
+    by = (float)(g_dbgY + HUD_PAD);
+}
+
+static int DebugButtonAt(float mx, float my)
+{
+    if (!g_debugMode) return -1;
+    DebugLayout();
+    for (int i = 0; i < DBG_BTN_COUNT; ++i) {
+        float bx, by;
+        DebugButtonRect(i, bx, by);
+        if (mx >= bx && mx <= bx + HUD_BTN_W && my >= by && my <= by + HUD_BTN_H)
+            return i;
+    }
+    return -1;
+}
+
+static void DebugAction(int btn)
+{
+    switch (btn) {
+    case DBG_DRY:                                 // 全部干枯（测试枯叶效果）
+        for (size_t i = 0; i < g_pots.size(); ++i) g_pots[i].moisture = 0.0f;
+        g_fullRedraw = true;
+        break;
+    case DBG_RAIN:
+        g_weather = WEATHER_RAIN;
+        g_weatherLeft = 30.0f;
+        g_weatherTimer = 90.0f;
+        break;
+    case DBG_SNOW:
+        g_weather = WEATHER_SNOW;
+        g_weatherLeft = 30.0f;
+        g_weatherTimer = 90.0f;
+        break;
+    case DBG_OFF:                                 // 关闭调试：不留任何持久状态
+        g_debugMode = false;
+        g_debugHot = -1;
+        g_fullRedraw = true;
+        break;
+    }
+}
+
+static void DrawDebugHud(Graphics& g)
+{
+    DebugLayout();
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+
+    SolidBrush panel(C(26, 20, 16, 235));
+    FillRectF(g, &panel, (float)g_dbgX, (float)g_dbgY, (float)g_dbgW, (float)g_dbgH);
+    SolidBrush edge(C(196, 148, 92, 240));
+    FillRectF(g, &edge, (float)g_dbgX, (float)g_dbgY, (float)g_dbgW, 2.0f);
+    FillRectF(g, &edge, (float)g_dbgX, (float)(g_dbgY + g_dbgH - 2), (float)g_dbgW, 2.0f);
+    FillRectF(g, &edge, (float)g_dbgX, (float)g_dbgY, 2.0f, (float)g_dbgH);
+    FillRectF(g, &edge, (float)(g_dbgX + g_dbgW - 2), (float)g_dbgY, 2.0f, (float)g_dbgH);
+
+    static Gdiplus::Font* font = nullptr;
+    static Gdiplus::StringFormat* fmt = nullptr;
+    if (!font) font = new Gdiplus::Font(L"Microsoft YaHei", 15.0f,
+                                        Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+    if (!fmt) {
+        fmt = new Gdiplus::StringFormat();
+        fmt->SetAlignment(Gdiplus::StringAlignmentCenter);
+        fmt->SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    }
+
+    const wchar_t* labels[DBG_BTN_COUNT] = { L"干枯", L"下雨", L"下雪", L"关闭调试模式" };
+    for (int i = 0; i < DBG_BTN_COUNT; ++i) {
+        float bx, by;
+        DebugButtonRect(i, bx, by);
+        bool hot = (i == g_debugHot);
+
+        SolidBrush b(hot ? C(122, 74, 42) : C(74, 52, 36));
+        FillRectF(g, &b, bx, by, (float)HUD_BTN_W, (float)HUD_BTN_H);
+        SolidBrush line(hot ? C(236, 190, 128) : C(150, 112, 72));
+        FillRectF(g, &line, bx, by, (float)HUD_BTN_W, 2.0f);
+        FillRectF(g, &line, bx, by + HUD_BTN_H - 2, (float)HUD_BTN_W, 2.0f);
+        FillRectF(g, &line, bx, by, 2.0f, (float)HUD_BTN_H);
+        FillRectF(g, &line, bx + HUD_BTN_W - 2, by, 2.0f, (float)HUD_BTN_H);
+
+        SolidBrush txt(C(246, 240, 230));
+        RectF layout(bx, by + 8.0f, (float)HUD_BTN_W, 24.0f);
+        g.DrawString(labels[i], -1, font, layout, fmt, &txt);
+    }
+}
+
 static void DrawScene(Graphics& g)
 {
+    // 淡云（降水时才有，画在最底层）
+    DrawClouds(g);
+
+    // 雨线画在花盆后面：雨从植物身后落下，碰到植物的一瞬溅起（v3.8）
+    if (!g_rain.empty()) {
+        SolidBrush rain(C(120, 176, 228, 220));
+        for (size_t i = 0; i < g_rain.size(); ++i)
+            FillRectF(g, &rain, g_rain[i].x, g_rain[i].y, PIX, PIX * 2.5f);
+    }
+
     // 泥土碎屑
     if (!g_crumbs.empty()) {
         SolidBrush crumb(C(96, 66, 42));
         for (size_t i = 0; i < g_crumbs.size(); ++i)
             FillRectF(g, &crumb, g_crumbs[i].x, g_crumbs[i].y, 3.0f, 3.0f);
     }
+
+    // 天气地面层：积水 + 积雪（画在花盆后面，盆底会压在水雪之上）
+    DrawWeatherFloor(g);
 
     for (size_t i = 0; i < g_pots.size(); ++i) {
         const Pot& p = g_pots[i];
@@ -1404,13 +2284,16 @@ static void DrawScene(Graphics& g)
         // 花盆最低点，用来算投影高度
         float lowest = b.y - hh + PotMaxY(b.angle, p.scale);
 
-        // 承托面上的投影：离地越高越小越淡
+        // 承托面上的投影：只有拿在手里 / 落在半空时才画（v3.8），
+        // 稳稳放在任务栏或窗口标题栏上不再显示
         float lift = Clampf((p.surfaceY - lowest) / 160.0f, 0.0f, 1.0f);
-        float sw = (92.0f - lift * 44.0f) * p.scale;
-        int   sa = (int)(100.0f - lift * 70.0f);
-        SolidBrush shadow(C(0, 0, 0, sa));
-        // 投影整块留在承托面之上，不能漏到任务栏上
-        FillPixelEllipse(g, &shadow, b.x, p.surfaceY - 6.0f, sw * 0.5f, 4.0f);
+        if (lowest < p.surfaceY - 8.0f) {
+            float sw = (92.0f - lift * 44.0f) * p.scale;
+            int   sa = (int)(100.0f - lift * 70.0f);
+            SolidBrush shadow(C(0, 0, 0, sa));
+            // 投影整块留在承托面之上，不能漏到任务栏上
+            FillPixelEllipse(g, &shadow, b.x, p.surfaceY - 6.0f, sw * 0.5f, 4.0f);
+        }
 
         // 花盆 + 植物共用同一个变换，保证一起旋转、一起缩放
         GraphicsState st = g.Save();
@@ -1420,6 +2303,7 @@ static void DrawScene(Graphics& g)
         DrawPlantLocal(g, -POT_H * 0.5f + 3.0f, p.plant, p.sway, p.poking);
         DrawPotLocal(g);
         DrawWaterAnim(g, p);
+        DrawSnowCapLocal(g, p);      // 植物顶部的积雪（v3.7）
         g.Restore(st);
     }
 
@@ -1433,6 +2317,21 @@ static void DrawScene(Graphics& g)
                       w.x, w.y, PIX, PIX);
         }
     }
+
+    // 天气粒子（v3.7）：雪花 / 水珠（雨线已改画在花盆后面）
+    if (!g_flakes.empty()) {
+        SolidBrush flake(C(240, 246, 252));
+        for (size_t i = 0; i < g_flakes.size(); ++i)
+            FillRectF(g, &flake, g_flakes[i].x, g_flakes[i].y, PIX, PIX);
+    }
+    if (!g_splash.empty()) {
+        SolidBrush drop(C(150, 208, 244, 210));
+        for (size_t i = 0; i < g_splash.size(); ++i)
+            FillRectF(g, &drop, g_splash[i].x, g_splash[i].y, PIX, PIX);
+    }
+
+    // 顶部提示条（v3.8）
+    DrawToast(g);
 }
 
 static void DestroyBackBuffer()
@@ -1527,6 +2426,68 @@ static void SpriteBounds(RectI& rc)
         if (c.x + 8.0f > r) r = c.x + 8.0f;
         if (c.y - 8.0f < t) t = c.y - 8.0f;
         if (c.y + 8.0f > b) b = c.y + 8.0f;
+    }
+
+    // 天气粒子（v3.7）：雨线 / 雪花 / 水珠
+    for (size_t i = 0; i < g_rain.size(); ++i) {
+        const RainDrop& d = g_rain[i];
+        if (d.x - 8.0f < l) l = d.x - 8.0f;
+        if (d.x + 8.0f > r) r = d.x + 8.0f;
+        if (d.y - 8.0f < t) t = d.y - 8.0f;
+        if (d.y + 20.0f > b) b = d.y + 20.0f;
+    }
+    for (size_t i = 0; i < g_flakes.size(); ++i) {
+        const SnowFlake& f = g_flakes[i];
+        if (f.x - 8.0f < l) l = f.x - 8.0f;
+        if (f.x + 8.0f > r) r = f.x + 8.0f;
+        if (f.y - 8.0f < t) t = f.y - 8.0f;
+        if (f.y + 8.0f > b) b = f.y + 8.0f;
+    }
+    for (size_t i = 0; i < g_splash.size(); ++i) {
+        const Splash& s = g_splash[i];
+        if (s.x - 8.0f < l) l = s.x - 8.0f;
+        if (s.x + 8.0f > r) r = s.x + 8.0f;
+        if (s.y - 8.0f < t) t = s.y - 8.0f;
+        if (s.y + 8.0f > b) b = s.y + 8.0f;
+    }
+
+    // 地面天气层：积水 / 积雪按天气区域各一段（v3.8.1 分区）
+    if (g_puddle > 0.5f || g_snowCover > 0.5f) {
+        RebuildWeatherZones();
+        for (size_t zi = 0; zi < g_zones.size(); ++zi) {
+            const WeatherZone& z = g_zones[zi];
+            if (z.l - 4.0f < l) l = z.l - 4.0f;
+            if (z.r + 4.0f > r) r = z.r + 4.0f;
+        }
+        float ytop = g_floorY - g_snowCover - g_puddle - 6.0f;
+        if (ytop < t) t = ytop;
+        if (g_floorY + 4.0f > b) b = g_floorY + 4.0f;
+    }
+
+    // 云（v3.8.2）：盖住每个天气区域整个落雨面，区域顶部往上约 40px
+    if (g_precip > 0.02f) {
+        RebuildWeatherZones();
+        for (size_t zi = 0; zi < g_zones.size(); ++zi) {
+            const WeatherZone& z = g_zones[zi];
+            if (z.l - 4.0f < l) l = z.l - 4.0f;
+            if (z.r + 4.0f > r) r = z.r + 4.0f;
+            float ctop = z.top - 44.0f;
+            if (ctop < t) t = ctop;
+            float cbot = z.top + 4.0f;
+            if (cbot > b) b = cbot;
+        }
+    }
+
+    // 顶部提示条
+    if (g_toastTimer > 0.0f) {
+        float tl = (float)((g_winW - TOAST_W) / 2) - 2.0f;
+        float tr = tl + TOAST_W + 4.0f;
+        float tt = (float)ToastTop() - 2.0f;
+        float tb = tt + TOAST_H + 4.0f;
+        if (tl < l) l = tl;
+        if (tr > r) r = tr;
+        if (tt < t) t = tt;
+        if (tb > b) b = tb;
     }
 
     if (l > r || t > b) { rc.l = rc.t = rc.r = rc.b = 0; return; }
@@ -1688,6 +2649,15 @@ static void Present()
         if (g_hudY + g_hudH + 2 > rc.b) rc.b = g_hudY + g_hudH + 2;
     }
 
+    // 调试模式工具条（v3.8）
+    if (g_debugMode) {
+        DebugLayout();
+        if (g_dbgX - 2 < rc.l) rc.l = g_dbgX - 2;
+        if (g_dbgY - 2 < rc.t) rc.t = g_dbgY - 2;
+        if (g_dbgX + g_dbgW + 2 > rc.r) rc.r = g_dbgX + g_dbgW + 2;
+        if (g_dbgY + g_dbgH + 2 > rc.b) rc.b = g_dbgY + g_dbgH + 2;
+    }
+
     if (rc.l < 0) rc.l = 0;
     if (rc.t < 0) rc.t = 0;
     if (rc.r > g_winW) rc.r = g_winW;
@@ -1704,6 +2674,7 @@ static void Present()
         if (g_floorY > 0.0f) gfx.SetClip(RectF(0.0f, 0.0f, (float)g_winW, g_floorY));
         DrawScene(gfx);
         if (g_editMode) DrawEditHud(gfx);
+        if (g_debugMode) DrawDebugHud(gfx);
     }
     PremultiplyRect(rc);
 
@@ -1802,7 +2773,8 @@ static void LoadConfig()
 }
 
 // 定时 + 退出时写盘：下次启动按这份清单恢复
-static void SaveConfig()
+// manual=true 表示用户在编辑模式里点了「保存」（自动保存传 false）
+static void SaveConfig(bool manual = false)
 {
     HANDLE f = CreateFileW(ConfigPath().c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1824,6 +2796,19 @@ static void SaveConfig()
         WriteFile(f, line, (DWORD)n, &wr, nullptr);
     }
     CloseHandle(f);
+
+    // v3.8：有花盆站在窗口标题栏上时提示——ini 只记录客户区坐标，
+    // 重启后这些花盆只会落回任务栏上（标题栏的位置没有写进配置）
+    bool onTitlebar = false;
+    for (size_t i = 0; i < g_pots.size(); ++i)
+        if (g_pots[i].supportHwnd) { onTitlebar = true; break; }
+    if (onTitlebar) {
+        static float s_lastAutoHint = -1e9f;
+        if (manual || g_time - s_lastAutoHint > 10.0f) {   // 自动保存按 10 秒节流
+            s_lastAutoHint = g_time;
+            ShowToast(L"提示：标题栏上的花盆只能保存在任务栏，重启后会落回任务栏");
+        }
+    }
 }
 
 static int GetEncoderClsid(const WCHAR* mime, CLSID* clsid)
@@ -2090,7 +3075,7 @@ static void HudAction(int btn)
         break;
     }
     case HUD_SAVE:
-        SaveConfig();                    // 只有点这里才写 ini
+        SaveConfig(true);                // 只有点这里才写 ini（手动保存，带提示）
         g_hudMsgTimer = 2.0f;
         g_fullRedraw = true;
         break;
@@ -2109,6 +3094,10 @@ static void OnLButtonDown(HWND hwnd, LPARAM lp)
 
     int hud = HudButtonAt(mx, my);
     if (hud >= 0) { HudAction(hud); return; }
+
+    // 调试模式工具条（v3.8）
+    int dbg = DebugButtonAt(mx, my);
+    if (dbg >= 0) { DebugAction(dbg); return; }
 
     int pot = PickPot(mx, my, false);
     if (pot >= 0) {
@@ -2145,6 +3134,13 @@ static void OnMouseMove(LPARAM lp)
     int hot = HudButtonAt(mx, my);
     if (hot != g_hudHot) {
         g_hudHot = hot;
+        g_fullRedraw = true;
+    }
+
+    // 调试模式工具条悬停高亮（v3.8）
+    int dhot = DebugButtonAt(mx, my);
+    if (dhot != g_debugHot) {
+        g_debugHot = dhot;
         g_fullRedraw = true;
     }
 
@@ -2206,6 +3202,7 @@ static void SpawnPot(float x, float y, PlantType plant)
     p.body.angVel = 0.0f;
     p.plant = plant;
     p.swayVel = 3.0f;
+    p.windPh = (float)(rand() % 1000) * 0.00628f;    // 0 ~ 2π，每盆错开风相位
     p.surfaceY = g_floorY;
     g_pots.push_back(p);
     g_fullRedraw = true;
@@ -2252,6 +3249,17 @@ static void ApplyMenuChoice(int idx)
         ExportPlantImages();
     } else if (idx == MENU_CMD_QUIT) {
         PostMessageW(g_hwnd, WM_CLOSE, 0, 0);   // 回到消息循环后再退出，避免在本窗口过程里销毁自己
+    } else if (idx == MENU_CMD_VERSION) {
+        // 版本号连点 7 次 = 打开调试模式（菜单保持打开，静默计数，无任何提示）
+        g_versionClicks++;
+        g_versionClickTimer = 3.0f;
+        if (g_versionClicks >= 7) {
+            g_versionClicks = 0;
+            g_versionClickTimer = 0.0f;
+            g_debugMode = true;
+            g_fullRedraw = true;
+            if (g_menu) DestroyWindow(g_menu);   // 开启成功才关菜单
+        }
     }
 }
 
@@ -2341,12 +3349,17 @@ static void PaintMenu(HWND hwnd)
         RGB(152, 106, 202), // 薰衣草
         RGB(96, 176, 76),   // 三叶草
         RGB(212, 58, 46),   // 辣椒
-        RGB(240, 240, 226)  // 蒲公英
+        RGB(240, 240, 226), // 蒲公英
+        RGB(244, 196, 58),  // 雏菊
+        RGB(96, 168, 118),  // 芦荟
+        RGB(108, 122, 214), // 牵牛花
+        RGB(244, 178, 196)  // 樱花
     };
-    // 命令项的代表色：浇水 / 编辑 / 调大 / 调小 / 放置 / 移除 / 导出 / 退出
+    // 命令项的代表色：浇水 / 编辑 / 调大 / 调小 / 放置 / 移除 / 导出 / 退出 / 版本号
     static const COLORREF kCmdDots[MENU_ITEM_COUNT - PLANT_COUNT] = {
         RGB(92, 176, 232), RGB(180, 170, 120), RGB(196, 148, 92), RGB(150, 112, 72),
-        RGB(120, 170, 110), RGB(190, 90, 80), RGB(96, 150, 190), RGB(130, 130, 130)
+        RGB(120, 170, 110), RGB(190, 90, 80), RGB(96, 150, 190), RGB(130, 130, 130),
+        RGB(160, 160, 160)
     };
 
     // 植物区与命令区之间的一条分隔线
@@ -2412,8 +3425,12 @@ static LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_LBUTTONUP: {
         int idx = MenuItemFromPoint(lp);
-        if (idx >= 0) ApplyMenuChoice(idx);
-        DestroyWindow(hwnd);
+        if (idx == MENU_CMD_VERSION) {
+            ApplyMenuChoice(idx);        // 版本号项不关菜单，方便连续点击 7 次（v3.8.2）
+        } else if (idx >= 0) {
+            ApplyMenuChoice(idx);
+            DestroyWindow(hwnd);
+        }
         return 0;
     }
 
@@ -2498,6 +3515,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (g_hudMsgTimer <= 0.0f) {
                     g_hudMsgTimer = 0.0f;
                     g_fullRedraw = true;
+                }
+            }
+            // 提示条倒计时（v3.8）
+            if (g_toastTimer > 0.0f) {
+                g_toastTimer -= DT;
+                if (g_toastTimer <= 0.0f) {
+                    g_toastTimer = 0.0f;
+                    g_fullRedraw = true;
+                }
+            }
+            // 版本号连点间隔超时清零（v3.8，静默）
+            if (g_versionClickTimer > 0.0f) {
+                g_versionClickTimer -= DT;
+                if (g_versionClickTimer <= 0.0f) {
+                    g_versionClickTimer = 0.0f;
+                    g_versionClicks = 0;
                 }
             }
             Present();
