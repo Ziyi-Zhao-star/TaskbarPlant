@@ -127,7 +127,7 @@ enum PlantType {
 };
 
 // 右键菜单：先是植物列表，再是命令
-static const wchar_t* kVersionText = L"v3.8.2";   // 菜单底部的版本号（连点 7 次开调试模式）
+static const wchar_t* kVersionText = L"v3.8.3";   // 菜单底部的版本号（连点 7 次开调试模式）
 
 enum MenuCmd {
     MENU_CMD_WATER = PLANT_COUNT,   // 浇水
@@ -188,6 +188,7 @@ struct Pot {
     float     waterAnim;  // 浇水动画剩余时间（秒），0 表示没在浇水
     float     shedTimer;  // 枯叶掉落节流
     float     windPh;     // 常年微风的相位偏移（每盆错开，避免多盆整齐划一地摇）
+    int       slot;       // 在已保存布局 g_savedLayout 里的槽位；-1 = 还没保存过（运行时新放的盆）
 };
 
 static HWND  g_hwnd = nullptr;
@@ -216,6 +217,10 @@ static std::vector<Crumb> g_crumbs;
 // 下次启动要恢复的花盆状态（配置文件里读出来的）
 struct PotSeed { int plant; float x, y, scale, moisture; };
 static std::vector<PotSeed> g_seeds;
+// 已保存的布局（v3.8.3）：ini 里写的就是这份快照。只有编辑模式里点「保存」才会
+// 用当前场景整体覆盖它；自动保存 / 退出保存只更新其中各盆的水分，位置永远不动——
+// 拖动、抛掷、放新盆、移除盆只有在编辑模式里保存后才会持久化
+static std::vector<PotSeed> g_savedLayout;
 static float g_saveTimer = 0.0f;         // 自动保存节流
 
 // 干枯时从植物上掉下来的枯叶碎片（带物理）
@@ -1347,11 +1352,10 @@ static std::vector<WeatherZone> g_zones;
 static void RebuildWeatherZones()
 {
     g_zones.clear();
-    if (g_pots.empty() || g_winW <= 0) {
-        WeatherZone z = { 0.0f, (float)g_winW, 60.0f };
-        g_zones.push_back(z);
-        return;
-    }
+    // v3.8.3：没有花盆就没有天气——以前这里会生成一个全屏区域，导致
+    // 一盆花都没有时雨雪照样铺满整个屏幕。本函数每个物理帧都会随
+    // 花盆的当前位置重新聚类（拖拽中的花盆实时跟随）。
+    if (g_pots.empty() || g_winW <= 0) return;
 
     // 按 x 排序（盆数很少，插入排序足够）
     std::vector<size_t> order(g_pots.size());
@@ -1455,7 +1459,9 @@ static void UpdateWeather(float dt)
             for (int i = 0; i < n; ++i) {
                 RainDrop d;
                 d.x  = z.l + (float)(rand() % 1000) * 0.001f * zw;
-                d.y  = z.top - (float)(rand() % 60);
+                // 出生点 = 云底边缘（云带底边 = z.top，阴影条 z.top-4~z.top），
+                // 雨的最上沿与云的最下沿相接触，雨像是从云里落出来的
+                d.y  = z.top + (float)(rand() % 5);
                 d.vy = RAIN_SPEED_MIN + (float)(rand() % 1000) * 0.001f
                      * (RAIN_SPEED_MAX - RAIN_SPEED_MIN);
                 g_rain.push_back(d);
@@ -1468,7 +1474,8 @@ static void UpdateWeather(float dt)
             for (int i = 0; i < n; ++i) {
                 SnowFlake f;
                 f.x   = z.l + (float)(rand() % 1000) * 0.001f * zw;
-                f.y   = z.top - (float)(rand() % 60);
+                // 与雨一致：雪从云底边缘出生，最上沿与云的最下沿相接触
+                f.y   = z.top + (float)(rand() % 5);
                 f.vy  = 55.0f + (float)(rand() % 80);
                 f.ph  = (float)(rand() % 628) * 0.01f;
                 f.amp = 10.0f + (float)(rand() % 16);
@@ -1543,21 +1550,23 @@ static void UpdateWeather(float dt)
     }
 
     // ---- 积水 / 积雪演化（v3.8：雪要化成水再消失，融雪汇入积水）----
+    // v3.8.3：融雪速度改按"雪是否接触水"判定——雪带贴着积水（puddle > 0.5px）
+    // 就以 0.55/s 快速融化成水，无论当前是雨天、雪天还是晴天（旧逻辑只看天气：
+    // 下雪天贴水的雪照样增长、晴天要熬 75 秒，雪压在水上就是不化）。
+    // 干燥环境（没有积水）才保留晴天慢融。
+    float melt = dt * 0.08f;                                   // 干燥：慢慢融化
+    if (g_weather == WEATHER_RAIN) melt = dt * 0.55f;          // 雨水直接打在雪上
+    if (g_puddle > 0.5f)           melt = dt * 0.55f;          // 雪贴着水：遇水即融
+    if (melt > g_snowCover) melt = g_snowCover;
+    g_snowCover = Clampf(g_snowCover - melt, 0.0f, SNOW_MAX);
+    g_puddle    = Clampf(g_puddle + melt * 0.8f, 0.0f, PUDDLE_MAX);
+
     if (g_weather == WEATHER_RAIN) {
         g_puddle = Clampf(g_puddle + dt * 0.30f, 0.0f, PUDDLE_MAX);
-        float melt = dt * 0.55f;                                          // 雨化雪
-        if (melt > g_snowCover) melt = g_snowCover;
-        g_snowCover = Clampf(g_snowCover - melt, 0.0f, SNOW_MAX);
-        g_puddle    = Clampf(g_puddle + melt * 0.8f, 0.0f, PUDDLE_MAX);
     } else if (g_weather == WEATHER_SNOW) {
-        g_snowCover = Clampf(g_snowCover + dt * 0.22f, 0.0f, SNOW_MAX);
-        g_puddle    = Clampf(g_puddle - dt * 0.12f, 0.0f, PUDDLE_MAX);
+        g_puddle = Clampf(g_puddle - dt * 0.12f, 0.0f, PUDDLE_MAX);   // 雪天水慢慢收干
     } else {
-        float melt = dt * 0.08f;                                          // 慢慢融化成水
-        if (melt > g_snowCover) melt = g_snowCover;
-        g_snowCover = Clampf(g_snowCover - melt, 0.0f, SNOW_MAX);
-        g_puddle    = Clampf(g_puddle + melt * 0.8f, 0.0f, PUDDLE_MAX);
-        g_puddle    = Clampf(g_puddle - dt * 0.20f, 0.0f, PUDDLE_MAX);    // 同时慢慢蒸发
+        g_puddle = Clampf(g_puddle - dt * 0.20f, 0.0f, PUDDLE_MAX);   // 晴天蒸发
     }
 }
 
@@ -2772,10 +2781,29 @@ static void LoadConfig()
     }
 }
 
-// 定时 + 退出时写盘：下次启动按这份清单恢复
-// manual=true 表示用户在编辑模式里点了「保存」（自动保存传 false）
+// 写盘（v3.8.3 重做）：ini 里的布局 = 上一次在编辑模式里点「保存」时的场景快照。
+// manual=true 表示用户在编辑模式里点了「保存」——用当前场景整体覆盖布局快照；
+// 自动保存（每 5 秒）与退出保存传 false——只把各盆的水分回写进快照，
+// **位置、数量、大小永远不动**。拖动、抛掷、放新盆、移除盆这些改动，
+// 只有进编辑模式点「保存」才会持久化到 ini。
 static void SaveConfig(bool manual = false)
 {
+    if (manual) {
+        g_savedLayout.clear();
+        for (size_t i = 0; i < g_pots.size(); ++i) {
+            const Pot& p = g_pots[i];
+            PotSeed s = { (int)p.plant, p.body.x, p.body.y, p.scale, p.moisture };
+            g_savedLayout.push_back(s);
+            g_pots[i].slot = (int)i;            // 每盆绑定到新布局的槽位
+        }
+    } else {
+        for (size_t i = 0; i < g_pots.size(); ++i) {
+            const Pot& p = g_pots[i];
+            if (p.slot >= 0 && p.slot < (int)g_savedLayout.size())
+                g_savedLayout[p.slot].moisture = p.moisture;
+        }
+    }
+
     HANDLE f = CreateFileW(ConfigPath().c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -2788,25 +2816,23 @@ static void SaveConfig(bool manual = false)
     int dn = sprintf(dry, "dry %d\r\n", (int)g_drySeconds);
     WriteFile(f, dry, (DWORD)dn, &wr, nullptr);
 
-    for (size_t i = 0; i < g_pots.size(); ++i) {
-        const Pot& p = g_pots[i];
+    for (size_t i = 0; i < g_savedLayout.size(); ++i) {
+        const PotSeed& s = g_savedLayout[i];
         char line[96];
         int n = sprintf(line, "%d %.1f %.1f %.3f %.3f\r\n",
-                        (int)p.plant, p.body.x, p.body.y, p.scale, p.moisture);
+                        s.plant, s.x, s.y, s.scale, s.moisture);
         WriteFile(f, line, (DWORD)n, &wr, nullptr);
     }
     CloseHandle(f);
 
-    // v3.8：有花盆站在窗口标题栏上时提示——ini 只记录客户区坐标，
-    // 重启后这些花盆只会落回任务栏上（标题栏的位置没有写进配置）
-    bool onTitlebar = false;
-    for (size_t i = 0; i < g_pots.size(); ++i)
-        if (g_pots[i].supportHwnd) { onTitlebar = true; break; }
-    if (onTitlebar) {
-        static float s_lastAutoHint = -1e9f;
-        if (manual || g_time - s_lastAutoHint > 10.0f) {   // 自动保存按 10 秒节流
-            s_lastAutoHint = g_time;
-            ShowToast(L"提示：标题栏上的花盆只能保存在任务栏，重启后会落回任务栏");
+    // 有花盆站在窗口标题栏上时提示——ini 只记录客户区坐标，
+    // 重启后这些花盆只会落回任务栏上（只在编辑模式手动保存时提示）
+    if (manual) {
+        for (size_t i = 0; i < g_pots.size(); ++i) {
+            if (g_pots[i].supportHwnd) {
+                ShowToast(L"提示：标题栏上的花盆只能保存在任务栏，重启后会落回任务栏");
+                break;
+            }
         }
     }
 }
@@ -2933,14 +2959,20 @@ static void LayoutWindow()
                 Pot& np = g_pots.back();
                 np.scale = s.scale;
                 np.moisture = s.moisture;
+                np.slot = (int)i;                       // 从 ini 恢复的盆绑定到布局槽位
                 np.body.x = Clampf(s.x, POT_W * 0.5f * s.scale,
                                    (float)g_winW - POT_W * 0.5f * s.scale);
                 np.body.y = Clampf(s.y, POT_H * s.scale, g_floorY);
                 np.body.vy = 0.0f;
             }
+            g_savedLayout = g_seeds;                    // 启动布局 = ini 里的布局
         } else {
             SpawnPot((float)((m.left + m.right) / 2 - vx), g_floorY, PLANT_SUNFLOWER);
-            g_pots.back().body.vy = 0.0f;
+            Pot& np = g_pots.back();
+            np.body.vy = 0.0f;
+            np.slot = 0;                                // 首次运行的默认盆视为已保存
+            PotSeed s = { (int)np.plant, np.body.x, np.body.y, np.scale, np.moisture };
+            g_savedLayout.push_back(s);
         }
     } else {
         // 分辨率 / 任务栏变化后把花盆夹回工作区内
@@ -3204,6 +3236,7 @@ static void SpawnPot(float x, float y, PlantType plant)
     p.swayVel = 3.0f;
     p.windPh = (float)(rand() % 1000) * 0.00628f;    // 0 ~ 2π，每盆错开风相位
     p.surfaceY = g_floorY;
+    p.slot = -1;               // 新放的盆还没有保存过，不进布局快照
     g_pots.push_back(p);
     g_fullRedraw = true;
 }
